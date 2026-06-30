@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from indexer import load_index, search
+from indexer import load_index, search_rerank
 
 load_dotenv()  # ANTHROPIC_API_KEY from .env
 
@@ -63,9 +63,11 @@ def chat():
     t0 = time.perf_counter()  # measure end-to-end answer latency (retrieval + LLM)
     user_message = request.json["message"]
 
-    # Retrieve the top-K most relevant chunks, then augment the prompt with a
-    # numbered context block so the model can ground its answer and cite sources.
-    hits = search(user_message, INDEX, k=5)
+    # Two-stage retrieval: wide dense recall, then cross-encoder rerank down to
+    # a tight, high-relevance set. Fewer/sharper chunks → better grounding and
+    # lower prompt cost. Augment the prompt with a numbered context block so the
+    # model can ground its answer and cite sources.
+    hits = search_rerank(user_message, INDEX, k=4, candidates=20)
     context = "\n\n".join(f"[{i + 1}] {h['text']}" for i, h in enumerate(hits))
     user_content = f"CONTEXT:\n{context}\n\nQUESTION:\n{user_message}"
 

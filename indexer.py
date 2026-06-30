@@ -30,6 +30,10 @@ from sentence_transformers import SentenceTransformer
 # Multilingual (50+ languages), 384-dim — same model as the /embedding project.
 # Lets the corpus and the queries be in different languages and still match.
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# Cross-encoder reranker: scores each (query, chunk) pair jointly, far more
+# precise than the bi-encoder cosine recall above. Used to re-order a wide
+# candidate pool down to the few chunks actually fed to the LLM.
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 INDEX_PATH = Path(__file__).parent / "index.pkl"
 DOCS_DIR = Path(__file__).parent / "documents"
 
@@ -427,11 +431,52 @@ def cosine_distance(a: list[float], b: list[float]) -> float:
 
 
 def search(query: str, records: list[dict], k: int = 5) -> list[dict]:
-    """Embed the query, return top-k records by cosine distance."""
+    """Embed the query, return top-k records by cosine distance (dense recall)."""
     [query_vec] = embed([query])
     scored = [(cosine_distance(r["embedding"], query_vec), r) for r in records]
     scored.sort(key=lambda x: x[0])
     return [r for _, r in scored[:k]]
+
+
+# ════════════════════════════════════════════════════════════════
+# Reranking: dense recall is fast but imprecise — it can rank a loosely
+# related chunk above the one that actually answers the question. A
+# cross-encoder reads (query, chunk) together and scores true relevance,
+# so we over-retrieve with the bi-encoder, then rerank down to a tight set.
+# ════════════════════════════════════════════════════════════════
+
+_reranker = None
+
+
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        from sentence_transformers import CrossEncoder
+        print(f"Loading reranker ({RERANK_MODEL})... (one-time download ~80MB)")
+        _reranker = CrossEncoder(RERANK_MODEL)
+    return _reranker
+
+
+def rerank(query: str, records: list[dict], k: int) -> list[dict]:
+    """Re-order records by cross-encoder relevance to the query; return top-k."""
+    if not records:
+        return []
+    scores = get_reranker().predict([(query, r["text"]) for r in records])
+    ranked = sorted(zip(scores, records), key=lambda pair: pair[0], reverse=True)
+    return [r for _, r in ranked[:k]]
+
+
+def search_rerank(
+    query: str,
+    records: list[dict],
+    k: int = 4,
+    candidates: int = 20,
+) -> list[dict]:
+    """Two-stage retrieval: dense recall of `candidates` chunks, then rerank
+    down to the `k` most relevant. Fewer, sharper chunks reach the LLM —
+    better grounding and lower prompt cost than feeding raw top-k cosine."""
+    pool = search(query, records, k=candidates)
+    return rerank(query, pool, k)
 
 
 def main() -> None:
