@@ -8,6 +8,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [elapsedMs, setElapsedMs] = useState(0)
   const [lastStats, setLastStats] = useState(null) // { usage, latencyMs } of the latest answer
+  const [openSource, setOpenSource] = useState(null) // "<messageIndex>:<citationN>" of the expanded source
   const timerRef = useRef(null)
 
   function startTimer() {
@@ -91,13 +92,36 @@ export default function App() {
               </div>
               {m.citations && m.citations.length > 0 && (
                 <div className="sources">
-                  Sources: {m.citations.map((c) => (
-                    <span key={c.n} className="source">
-                      [{c.n}] {c.source}
-                    </span>
-                  ))}
+                  <span className="sources-label">Sources:</span>
+                  {m.citations.map((c) => {
+                    const key = `${i}:${c.n}`
+                    const open = openSource === key
+                    return (
+                      <button
+                        key={c.n}
+                        type="button"
+                        className={`source ${open ? 'source-open' : ''}`}
+                        aria-expanded={open}
+                        onClick={() => setOpenSource(open ? null : key)}
+                      >
+                        [{c.n}] {c.source}
+                      </button>
+                    )
+                  })}
                 </div>
               )}
+              {(() => {
+                const oc = m.citations?.find((c) => openSource === `${i}:${c.n}`)
+                if (!oc) return null
+                return (
+                  <div className="source-detail">
+                    <div className="source-detail-head">
+                      [{oc.n}] {oc.source} · chunk #{oc.chunk_index}
+                    </div>
+                    <div className="source-detail-text">{oc.text ?? '(no source text returned)'}</div>
+                  </div>
+                )
+              })()}
               {(m.usage || m.latencyMs != null) && (
                 <div className="usage">
                   {m.usage && `Tokens: ${m.usage.total_tokens} (in ${m.usage.input_tokens} / out ${m.usage.output_tokens})`}

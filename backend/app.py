@@ -106,8 +106,9 @@ def chat():
 def _build_citations(answer: str, hits: list[dict]) -> list[dict]:
     """Return one citation entry per unique valid [n] used in the answer.
 
-    Starter implementation: extract the numbers, drop out-of-range, return
-    the matching hit's filename + chunk_index. Improve as you like.
+    Extract the numbers, drop out-of-range, and return the matching hit's
+    filename, chunk_index, and the chunk text itself so the frontend can show
+    the original retrieved context behind each citation.
     """
     used = [int(n) for n in re.findall(r"\[(\d+)\]", answer)]
     seen: set[int] = set()
@@ -121,6 +122,7 @@ def _build_citations(answer: str, hits: list[dict]) -> list[dict]:
             "n": n,
             "source": h["source"],
             "chunk_index": h["chunk_index"],
+            "text": h["text"],
         })
     return citations
 
