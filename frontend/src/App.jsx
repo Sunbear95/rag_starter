@@ -1,4 +1,6 @@
 import { useState, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 export default function App() {
   const [messages, setMessages] = useState([])
@@ -59,13 +61,34 @@ export default function App() {
   const sessionTokens = answered.reduce((sum, m) => sum + m.usage.total_tokens, 0)
 
   return (
-    <div className="layout">
+    <div className="page">
+      <header className="faa-header">
+        <div className="faa-brand">
+          <span className="faa-mark" aria-hidden="true">✈</span>
+          <span className="faa-word">FAA</span>
+          <span className="faa-sub">Docs Assistant</span>
+        </div>
+        <div className={`faa-status ${loading ? 'on' : ''}`}>
+          <span className="dot" aria-hidden="true" />
+          {loading ? 'working' : 'live'}
+        </div>
+      </header>
+
+      <div className="layout">
       <div className="app">
-        <h1>RAG Chat</h1>
         <div className="messages">
           {messages.map((m, i) => (
             <div key={i} className={`msg msg-${m.role}`}>
-              <div className="msg-body"><b>{m.role}:</b> {m.text}</div>
+              <div className="msg-body">
+                <b className="msg-role">{m.role}</b>
+                {m.role === 'assistant' ? (
+                  <div className="md">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>
+                  </div>
+                ) : (
+                  <span className="msg-text">{m.text}</span>
+                )}
+              </div>
               {m.citations && m.citations.length > 0 && (
                 <div className="sources">
                   Sources: {m.citations.map((c) => (
@@ -99,41 +122,43 @@ export default function App() {
 
       <aside className="stats-panel" aria-live="polite">
         <h2>Stats</h2>
+        <div className="stats-body">
+          <div className="stat-status">
+            {loading
+              ? <span className="stat-live">⏱ {(elapsedMs / 1000).toFixed(1)}s</span>
+              : <span className="stat-idle">idle</span>}
+          </div>
 
-        <div className="stat-status">
-          {loading
-            ? <span className="stat-live">⏱ {(elapsedMs / 1000).toFixed(1)}s</span>
-            : <span className="stat-idle">idle</span>}
-        </div>
+          <div className="stat-group">
+            <div className="stat-title">Last answer</div>
+            <div className="stat-row">
+              <span className="stat-key">Time</span>
+              <span className="stat-val">{lastStats?.latencyMs != null ? `${(lastStats.latencyMs / 1000).toFixed(2)}s` : '—'}</span>
+            </div>
+            <div className="stat-row">
+              <span className="stat-key">Tokens</span>
+              <span className="stat-val">{lastStats?.usage ? lastStats.usage.total_tokens : '—'}</span>
+            </div>
+            <div className="stat-row stat-dim">
+              <span className="stat-key">in / out</span>
+              <span className="stat-val">{lastStats?.usage ? `${lastStats.usage.input_tokens} / ${lastStats.usage.output_tokens}` : '—'}</span>
+            </div>
+          </div>
 
-        <div className="stat-group">
-          <div className="stat-title">Last answer</div>
-          <div className="stat-row">
-            <span className="stat-key">Time</span>
-            <span className="stat-val">{lastStats?.latencyMs != null ? `${(lastStats.latencyMs / 1000).toFixed(2)}s` : '—'}</span>
-          </div>
-          <div className="stat-row">
-            <span className="stat-key">Tokens</span>
-            <span className="stat-val">{lastStats?.usage ? lastStats.usage.total_tokens : '—'}</span>
-          </div>
-          <div className="stat-row stat-dim">
-            <span className="stat-key">in / out</span>
-            <span className="stat-val">{lastStats?.usage ? `${lastStats.usage.input_tokens} / ${lastStats.usage.output_tokens}` : '—'}</span>
-          </div>
-        </div>
-
-        <div className="stat-group">
-          <div className="stat-title">Session</div>
-          <div className="stat-row">
-            <span className="stat-key">Requests</span>
-            <span className="stat-val">{answered.length}</span>
-          </div>
-          <div className="stat-row">
-            <span className="stat-key">Total tokens</span>
-            <span className="stat-val">{sessionTokens}</span>
+          <div className="stat-group">
+            <div className="stat-title">Session</div>
+            <div className="stat-row">
+              <span className="stat-key">Requests</span>
+              <span className="stat-val">{answered.length}</span>
+            </div>
+            <div className="stat-row">
+              <span className="stat-key">Total tokens</span>
+              <span className="stat-val">{sessionTokens}</span>
+            </div>
           </div>
         </div>
       </aside>
+      </div>
     </div>
   )
 }
