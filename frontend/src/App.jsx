@@ -54,57 +54,86 @@ export default function App() {
     }
   }
 
-  // Live timer while generating; the latest answer's time + tokens when idle.
-  let indicator = null
-  if (loading) {
-    indicator = `⏱ ${(elapsedMs / 1000).toFixed(1)}s`
-  } else if (lastStats) {
-    const t = lastStats.latencyMs != null ? `${(lastStats.latencyMs / 1000).toFixed(2)}s` : ''
-    const u = lastStats.usage
-      ? `${lastStats.usage.total_tokens} tok (in ${lastStats.usage.input_tokens} / out ${lastStats.usage.output_tokens})`
-      : ''
-    indicator = [t, u].filter(Boolean).join(' · ')
-  }
+  // Session totals across all answered messages.
+  const answered = messages.filter((m) => m.role === 'assistant' && m.usage)
+  const sessionTokens = answered.reduce((sum, m) => sum + m.usage.total_tokens, 0)
 
   return (
-    <div className="app">
-      <h1>RAG Chat</h1>
-      <div className="messages">
-        {messages.map((m, i) => (
-          <div key={i} className={`msg msg-${m.role}`}>
-            <div className="msg-body"><b>{m.role}:</b> {m.text}</div>
-            {m.citations && m.citations.length > 0 && (
-              <div className="sources">
-                Sources: {m.citations.map((c) => (
-                  <span key={c.n} className="source">
-                    [{c.n}] {c.source}
-                  </span>
-                ))}
-              </div>
-            )}
-            {(m.usage || m.latencyMs != null) && (
-              <div className="usage">
-                {m.usage && `Tokens: ${m.usage.total_tokens} (in ${m.usage.input_tokens} / out ${m.usage.output_tokens})`}
-                {m.usage && m.latencyMs != null && ' · '}
-                {m.latencyMs != null && `${(m.latencyMs / 1000).toFixed(2)}s`}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-      <form onSubmit={send}>
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask a question about the indexed docs..."
-          autoFocus
-          disabled={loading}
-        />
-        <button type="submit" disabled={loading}>{loading ? '…' : 'Send'}</button>
-        <div className={`indicator ${loading ? 'indicator-live' : ''}`} aria-live="polite">
-          {indicator}
+    <div className="layout">
+      <div className="app">
+        <h1>RAG Chat</h1>
+        <div className="messages">
+          {messages.map((m, i) => (
+            <div key={i} className={`msg msg-${m.role}`}>
+              <div className="msg-body"><b>{m.role}:</b> {m.text}</div>
+              {m.citations && m.citations.length > 0 && (
+                <div className="sources">
+                  Sources: {m.citations.map((c) => (
+                    <span key={c.n} className="source">
+                      [{c.n}] {c.source}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {(m.usage || m.latencyMs != null) && (
+                <div className="usage">
+                  {m.usage && `Tokens: ${m.usage.total_tokens} (in ${m.usage.input_tokens} / out ${m.usage.output_tokens})`}
+                  {m.usage && m.latencyMs != null && ' · '}
+                  {m.latencyMs != null && `${(m.latencyMs / 1000).toFixed(2)}s`}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
-      </form>
+        <form onSubmit={send}>
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Ask a question about the indexed docs..."
+            autoFocus
+            disabled={loading}
+          />
+          <button type="submit" disabled={loading}>{loading ? '…' : 'Send'}</button>
+        </form>
+      </div>
+
+      <aside className="stats-panel" aria-live="polite">
+        <h2>Stats</h2>
+
+        <div className="stat-status">
+          {loading
+            ? <span className="stat-live">⏱ {(elapsedMs / 1000).toFixed(1)}s</span>
+            : <span className="stat-idle">idle</span>}
+        </div>
+
+        <div className="stat-group">
+          <div className="stat-title">Last answer</div>
+          <div className="stat-row">
+            <span className="stat-key">Time</span>
+            <span className="stat-val">{lastStats?.latencyMs != null ? `${(lastStats.latencyMs / 1000).toFixed(2)}s` : '—'}</span>
+          </div>
+          <div className="stat-row">
+            <span className="stat-key">Tokens</span>
+            <span className="stat-val">{lastStats?.usage ? lastStats.usage.total_tokens : '—'}</span>
+          </div>
+          <div className="stat-row stat-dim">
+            <span className="stat-key">in / out</span>
+            <span className="stat-val">{lastStats?.usage ? `${lastStats.usage.input_tokens} / ${lastStats.usage.output_tokens}` : '—'}</span>
+          </div>
+        </div>
+
+        <div className="stat-group">
+          <div className="stat-title">Session</div>
+          <div className="stat-row">
+            <span className="stat-key">Requests</span>
+            <span className="stat-val">{answered.length}</span>
+          </div>
+          <div className="stat-row">
+            <span className="stat-key">Total tokens</span>
+            <span className="stat-val">{sessionTokens}</span>
+          </div>
+        </div>
+      </aside>
     </div>
   )
 }

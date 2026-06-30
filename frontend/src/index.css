@@ -5,10 +5,70 @@ body {
   color: #1d1d1f;
 }
 
-.app {
-  max-width: 720px;
+.layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  max-width: 960px;
   margin: 2rem auto;
   padding: 1rem;
+}
+
+.app {
+  flex: 1;
+  min-width: 0;
+}
+
+.stats-panel {
+  flex: 0 0 190px;
+  position: sticky;
+  top: 2rem;
+  background: white;
+  border: 1px solid #e5e5ea;
+  border-radius: 8px;
+  padding: 0.8rem 1rem 1rem;
+}
+.stats-panel h2 {
+  margin: 0 0 0.6rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.stat-status {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 1.1rem;
+  font-variant-numeric: tabular-nums;
+  padding: 0.3rem 0;
+  margin-bottom: 0.6rem;
+  border-bottom: 1px solid #f0f0f3;
+}
+.stat-live { color: #0066cc; }
+.stat-idle { color: #bbb; }
+
+.stat-group { margin-top: 0.7rem; }
+.stat-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #999;
+  margin-bottom: 0.25rem;
+}
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  padding: 0.12rem 0;
+}
+.stat-key { color: #666; }
+.stat-val {
+  font-family: ui-monospace, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  color: #1d1d1f;
+}
+.stat-dim .stat-key, .stat-dim .stat-val { color: #aaa; }
+
+@media (max-width: 680px) {
+  .layout { flex-direction: column; }
+  .stats-panel { position: static; width: 100%; flex-basis: auto; box-sizing: border-box; }
 }
 
 h1 {
@@ -79,18 +139,3 @@ button {
 }
 button:hover { background: #0055aa; }
 button:disabled { background: #9bbfe0; cursor: default; }
-
-/* Live time/token indicator beside the chat input. */
-.indicator {
-  flex: none;
-  min-width: 11rem;
-  text-align: right;
-  font-size: 0.8rem;
-  color: #999;
-  font-family: ui-monospace, Menlo, monospace;
-  white-space: nowrap;
-}
-.indicator-live {
-  color: #0066cc;
-  font-variant-numeric: tabular-nums;
-}
