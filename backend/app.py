@@ -87,6 +87,18 @@ def chat():
 
     citations = _build_citations(answer, hits)
 
+    # Every chunk fed to the model as context (numbered to match the [n] markers),
+    # so the UI can show exactly what was retrieved — not just what got cited.
+    retrieved = [
+        {
+            "n": i + 1,
+            "source": h["source"],
+            "chunk_index": h["chunk_index"],
+            "text": h["text"],
+        }
+        for i, h in enumerate(hits)
+    ]
+
     usage = {
         "input_tokens": resp.usage.input_tokens,
         "output_tokens": resp.usage.output_tokens,
@@ -98,6 +110,7 @@ def chat():
     return jsonify({
         "reply": answer,
         "citations": citations,
+        "retrieved": retrieved,
         "usage": usage,
         "latency_ms": latency_ms,
     })
