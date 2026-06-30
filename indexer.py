@@ -1,12 +1,28 @@
 """Context Management RAG starter — indexer.
 
-Walks documents/, chunks each file, embeds chunks, persists the index to disk
-so the chat backend can load it without re-indexing.
+Walks documents/, extracts + chunks each file, embeds chunks, and persists the
+index to disk so the chat backend can load it without re-indexing.
 
-TODO: implement chunk_text(). The embedding and storage code is provided so
-you can focus on the structure.
+The corpus is the Federal Aviation Regulations (14 CFR, Title 14 of the Code of
+Federal Regulations). Those ship as two-column PDFs with running page headers
+and line-break hyphenation, so the PDF path here does three things that matter
+for retrieval quality:
+
+  1. Extraction — split each page into its two columns and read them in order
+     (a naive extract interleaves the columns line-by-line), dropping the
+     running header/footer band.
+  2. Cleanup — rejoin words hyphenated across line breaks, collapse wrapped
+     lines, and strip Federal-Register amendment-history noise.
+  3. Section-aware chunking — split on `§` section boundaries and prefix every
+     chunk with a `14 CFR Part N > Subpart X > § N.M Title` breadcrumb, carrying
+     the regulatory structure into both the embedding and the cited text.
+
+Plain .md/.txt files still work via the generic chunker below, so you can swap
+in your own corpus.
 """
+import bisect
 import pickle
+import re
 from pathlib import Path
 
 from sentence_transformers import SentenceTransformer
@@ -17,26 +33,19 @@ MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 INDEX_PATH = Path(__file__).parent / "index.pkl"
 DOCS_DIR = Path(__file__).parent / "documents"
 
+TARGET_CHARS = 1200      # ~300 tokens; fits the embedding model's window with the breadcrumb
+OVERLAP_CHARS = 150
+
 
 # ════════════════════════════════════════════════════════════════
-# TODO — implement chunk_text
-#
-# Split `text` into overlapping chunks. A reasonable default:
-#   - ~1000 characters per chunk
-#   - ~100 characters of overlap
-#   - try to break on paragraph boundaries (\n\n) when possible
-#
-# Return a list of non-empty strings.
-# See the lecture slide on chunking for one working implementation.
+# Generic text chunking (.md / .txt) — Wikipedia-style prose
 # ════════════════════════════════════════════════════════════════
 
 def _looks_like_heading(para: str) -> bool:
     """Heuristic: is this paragraph a section heading rather than body prose?
 
-    The corpus is Wikipedia plain-text extracts, where section titles appear as
-    short standalone lines (e.g. "Background", "Prime crew") — NOT markdown
-    headers. We treat a single short line with no terminal sentence punctuation
-    as a heading. Markdown headers (leading '#') always count.
+    For plain-text corpora where section titles appear as short standalone
+    lines. Markdown headers (leading '#') always count.
     """
     if "\n" in para:  # multi-line block is body text, not a heading
         return False
@@ -54,7 +63,6 @@ def _overlap_tail(text: str, overlap_chars: int) -> str:
     if overlap_chars <= 0 or len(text) <= overlap_chars:
         return text if len(text) <= overlap_chars else ""
     tail = text[-overlap_chars:]
-    # Prefer to start the overlap after a sentence break; fall back to a word break.
     for sep in (". ", "? ", "! ", " "):
         idx = tail.find(sep)
         if idx != -1:
@@ -64,26 +72,16 @@ def _overlap_tail(text: str, overlap_chars: int) -> str:
 
 def chunk_text(
     text: str,
-    target_chars: int = 1000,
-    overlap_chars: int = 100,
+    target_chars: int = TARGET_CHARS,
+    overlap_chars: int = OVERLAP_CHARS,
     doc_title: str | None = None,
 ) -> list[str]:
-    """Split text into overlapping, context-prefixed chunks.
+    """Split plain text into overlapping, heading-aware chunks.
 
-    Strategy:
-      - Split on blank lines into paragraphs; track the current section heading
-        (short standalone lines like "Background", "Prime crew").
-      - Greedily pack body paragraphs into chunks of ~target_chars, never
-        crossing a heading boundary (each section starts a fresh chunk).
-      - Prefix every chunk with a breadcrumb ("<doc_title> > <heading>") so the
-        document and section context ride along into the embedding AND the text
-        shown to the model — this is what lets a query naming a specific mission
-        match chunks whose body never repeats the mission name.
-      - Carry ~overlap_chars of sentence-aligned trailing context across cuts
-        within a section so information isn't lost at chunk boundaries.
-
-    Paragraphs longer than target_chars are split by character window.
-    Returns a list of non-empty strings.
+    Greedily packs body paragraphs into ~target_chars chunks, never crossing a
+    heading boundary, prefixing each chunk with a `<doc_title> > <heading>`
+    breadcrumb, and carrying ~overlap_chars of sentence-aligned context across
+    cuts within a section. Returns a list of non-empty strings.
     """
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
@@ -93,7 +91,6 @@ def chunk_text(
 
     def breadcrumb(heading: str | None) -> str:
         parts = [doc_title] if doc_title else []
-        # Skip a section heading that just repeats the document title (the H1).
         if heading and heading.strip().lower() != (doc_title or "").strip().lower():
             parts.append(heading)
         return " > ".join(parts)
@@ -107,11 +104,10 @@ def chunk_text(
 
     for para in paragraphs:
         if _looks_like_heading(para):
-            flush()  # a new section always starts a new chunk
+            flush()
             current_heading = para.lstrip("#").strip()
             continue
 
-        # Split an over-long paragraph into target-sized windows.
         pieces = (
             [para]
             if len(para) <= target_chars
@@ -127,6 +123,200 @@ def chunk_text(
 
     flush()
     return [c for c in chunks if c.strip()]
+
+
+# ════════════════════════════════════════════════════════════════
+# CFR PDF extraction + cleanup
+# ════════════════════════════════════════════════════════════════
+
+# Running header lines repeated on every page — pure noise once we know the §.
+_HEADER_LINES = [
+    re.compile(r"^Federal Aviation Administration.*$", re.M),
+    re.compile(r"^.*\bCFR\b.*Edition.*$", re.M),
+    re.compile(r"^\s*VerDate.*$", re.M),
+    re.compile(r"^\s*PsN:.*$", re.M),
+]
+# Bracketed Federal-Register amendment-history blocks, e.g. "[Docket No. ...; 89 FR 80339, Oct. 2, 2024]".
+_FR_CITATION = re.compile(r"\[[^\]]*\bFR\b[^\]]*\]", re.S)
+# "EFFECTIVE DATE NOTE: ... effective <date>." trailing administrative notes.
+_EFFECTIVE_NOTE = re.compile(r"EFFECTIVE DATE NOTE:.*?effective[^.]*\.", re.S | re.I)
+
+
+def _clean(text: str) -> str:
+    """Normalize one page's column-joined text into clean prose."""
+    for pat in _HEADER_LINES:
+        text = pat.sub("", text)
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)   # rejoin words split across line breaks
+    text = re.sub(r"[ \t]*\n[ \t]*", " ", text)     # collapse wrapped lines into spaces
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def _printed_page(raw: str, fallback: int) -> int:
+    """Best-effort CFR printed page number from a page's raw text.
+
+    Even pages carry it at the very start of the header line, odd pages at the
+    end. Falls back to the 1-based PDF page index.
+    """
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if lines:
+        m = re.match(r"^(\d{1,5})\b", lines[0])
+        if m:
+            return int(m.group(1))
+        m = re.search(r"\b(\d{1,5})$", lines[-1])
+        if m:
+            return int(m.group(1))
+    return fallback
+
+
+def extract_pdf(path: Path) -> tuple[str, list[tuple[int, int]]]:
+    """Extract a CFR PDF to a single cleaned text stream.
+
+    Returns (full_text, page_spans) where page_spans is a list of
+    (char_offset, printed_page) marking where each page begins in full_text, so
+    a chunk's offset can be mapped back to a citable page number.
+    """
+    import pdfplumber
+
+    parts: list[str] = []
+    page_spans: list[tuple[int, int]] = []
+    offset = 0
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            w, h = page.width, page.height
+            # Crop away the top header / bottom footer band, then read each
+            # column top-to-bottom so the two-column layout reads in order.
+            left = page.crop((0, 50, w / 2, h - 42)).extract_text() or ""
+            right = page.crop((w / 2, 50, w, h - 42)).extract_text() or ""
+            cleaned = _clean(left + "\n" + right)
+            if not cleaned:
+                continue
+            page_spans.append((offset, _printed_page(page.extract_text() or "", i + 1)))
+            parts.append(cleaned)
+            offset += len(cleaned) + 1  # +1 for the joining space below
+    return " ".join(parts), page_spans
+
+
+# ════════════════════════════════════════════════════════════════
+# CFR structure parsing — Part / Subpart / § sections
+# ════════════════════════════════════════════════════════════════
+
+_PART_RE = re.compile(r"\bPART\s+(\d+[A-Z]?)\s*[—–-]\s*([A-Z][^\n]{0,80})")
+_SUBPART_RE = re.compile(r"\bSubpart\s+([A-Z]+)\s*[—–-]\s*([A-Z][A-Za-z,\s]{0,60})")
+# Trailing run-on noise after a Subpart title: an ALL-CAPS word (SOURCE, GENERAL)
+# or "Sec" that belongs to the following block, not the title.
+_SUBPART_TITLE_TAIL = re.compile(r"\s+(?:[A-Z]{2,}|Sec)\b.*$")
+# A real § heading: number followed by a Title-case heading ending in a period.
+# Cross-references like "§61.3(b)" or "under §61.41 of this part" don't match
+# (no Title-case heading word after the number).
+_SECTION_RE = re.compile(r"§\s*(\d+\.\d+[a-z]?)\s+([A-Z][^.]{2,140}?\.)")
+
+
+def _most_recent(positions: list[tuple[int, object]], at: int) -> object | None:
+    """Value of the last (offset, value) entry whose offset <= `at`."""
+    i = bisect.bisect_right([p[0] for p in positions], at) - 1
+    return positions[i][1] if i >= 0 else None
+
+
+def parse_cfr(full_text: str, page_spans: list[tuple[int, int]], source: str) -> list[dict]:
+    """Split a CFR text stream into one record per § section.
+
+    Tracks the enclosing Part and Subpart for each section's breadcrumb, drops
+    the front-matter table of contents by keeping only the longest body per
+    (part, section), and strips Federal-Register amendment noise from bodies.
+    """
+    parts_pos = [(m.start(), m.group(1)) for m in _PART_RE.finditer(full_text)]
+    subparts_pos = [(m.start(), (m.group(1), _SUBPART_TITLE_TAIL.sub("", m.group(2).strip())))
+                    for m in _SUBPART_RE.finditer(full_text)]
+
+    sec_matches = list(_SECTION_RE.finditer(full_text))
+    # Body of a section runs until the next structural marker of any kind.
+    boundaries = sorted(
+        [m.start() for m in sec_matches]
+        + [p[0] for p in parts_pos]
+        + [p[0] for p in subparts_pos]
+    )
+    offsets = [s[0] for s in page_spans]
+
+    def page_at(off: int) -> int | None:
+        i = bisect.bisect_right(offsets, off) - 1
+        return page_spans[i][1] if i >= 0 else None
+
+    # Best body per (part, number) — the TOC copy is short, the real one long.
+    best: dict[tuple[str, str], dict] = {}
+    for m in sec_matches:
+        number, title = m.group(1), m.group(2).strip().rstrip(".")
+        body_start = m.end()
+        bi = bisect.bisect_right(boundaries, body_start - 1)
+        body_end = boundaries[bi] if bi < len(boundaries) else len(full_text)
+        body = full_text[body_start:body_end]
+        body = _FR_CITATION.sub("", body)
+        body = _EFFECTIVE_NOTE.sub("", body)
+        body = re.sub(r"\s{2,}", " ", body).strip()
+
+        part = _most_recent(parts_pos, m.start())
+        sub = _most_recent(subparts_pos, m.start())
+        key = (part or "?", number)
+        prev = best.get(key)
+        if prev is None or len(body) > len(prev["_body"]):
+            best[key] = {
+                "part": part,
+                "subpart": sub,           # (letter, title) or None
+                "section": number,
+                "section_title": title,
+                "page": page_at(m.start()),
+                "_body": body,
+                "_start": m.start(),
+            }
+
+    records = sorted(best.values(), key=lambda r: r["_start"])
+    return [r for r in records if r["_body"]]
+
+
+def _breadcrumb(rec: dict) -> str:
+    crumb = f"14 CFR Part {rec['part']}" if rec["part"] else "14 CFR"
+    if rec["subpart"]:
+        letter, title = rec["subpart"]
+        crumb += f" > Subpart {letter}—{title}"
+    crumb += f" > § {rec['section']} {rec['section_title']}".rstrip()
+    return crumb
+
+
+def _split_body(body: str, target: int = TARGET_CHARS, overlap: int = OVERLAP_CHARS) -> list[str]:
+    """Split an over-long section body at sentence boundaries with overlap."""
+    if len(body) <= target:
+        return [body]
+    pieces: list[str] = []
+    start = 0
+    while start < len(body):
+        end = start + target
+        if end >= len(body):
+            pieces.append(body[start:].strip())
+            break
+        # Prefer to cut at a sentence boundary inside the last 200 chars.
+        window = body[end - 200:end]
+        cut = max(window.rfind(". "), window.rfind("; "))
+        if cut != -1:
+            end = end - 200 + cut + 1
+        pieces.append(body[start:end].strip())
+        start = max(end - overlap, start + 1)
+    return [p for p in pieces if p]
+
+
+def cfr_chunks(rec: dict) -> list[dict]:
+    """Expand one section record into breadcrumb-prefixed chunk dicts."""
+    crumb = _breadcrumb(rec)
+    out = []
+    for piece in _split_body(rec["_body"]):
+        out.append({
+            "part": rec["part"],
+            "subpart": rec["subpart"][0] if rec["subpart"] else None,
+            "section": f"§ {rec['section']}",
+            "section_title": rec["section_title"],
+            "page": rec["page"],
+            "text": f"{crumb}\n\n{piece}",
+        })
+    return out
 
 
 # ════════════════════════════════════════════════════════════════
@@ -152,12 +342,11 @@ def embed(texts: list[str]) -> list[list[float]]:
 
 
 # ════════════════════════════════════════════════════════════════
-# Provided: build / save / load / search
+# Build / save / load / search
 # ════════════════════════════════════════════════════════════════
 
 def _doc_title(text: str, fallback: str) -> str:
-    """Use the first markdown H1 ('# Title') as the document title, else the
-    filename stem (e.g. 'apollo-11' -> 'apollo 11')."""
+    """First markdown H1 ('# Title') as the document title, else the filename."""
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("# "):
@@ -167,25 +356,50 @@ def _doc_title(text: str, fallback: str) -> str:
     return fallback.replace("-", " ")
 
 
+def _records_for_file(path: Path) -> list[dict]:
+    """Return per-chunk dicts (without embeddings) for one source file."""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        full_text, page_spans = extract_pdf(path)
+        sections = parse_cfr(full_text, page_spans, path.name)
+        chunks: list[dict] = []
+        for rec in sections:
+            chunks.extend(cfr_chunks(rec))
+        return chunks
+    if suffix in (".md", ".txt"):
+        text = path.read_text()
+        title = _doc_title(text, path.stem)
+        return [
+            {"part": None, "subpart": None, "section": None,
+             "section_title": None, "page": None, "text": c}
+            for c in chunk_text(text, doc_title=title)
+        ]
+    return []
+
+
 def build_index() -> list[dict]:
-    """Walk DOCS_DIR, chunk each file, embed, return list of records."""
+    """Walk DOCS_DIR, extract + chunk each file, embed, return list of records."""
     records: list[dict] = []
     chunk_id = 0
     for path in sorted(DOCS_DIR.glob("*")):
-        if path.is_dir() or path.suffix.lower() not in (".md", ".txt"):
+        if path.is_dir() or path.suffix.lower() not in (".pdf", ".md", ".txt"):
             continue
-        text = path.read_text()
-        title = _doc_title(text, path.stem)
-        chunks = chunk_text(text, doc_title=title)
+        chunks = _records_for_file(path)
         if not chunks:
+            print(f"  {path.name}: no chunks (skipped)")
             continue
-        vectors = embed(chunks)
+        vectors = embed([c["text"] for c in chunks])
         for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
             records.append({
                 "chunk_id": chunk_id,
                 "source": path.name,
                 "chunk_index": i,
-                "text": chunk,
+                "part": chunk["part"],
+                "subpart": chunk["subpart"],
+                "section": chunk["section"],
+                "section_title": chunk["section_title"],
+                "page": chunk["page"],
+                "text": chunk["text"],
                 "embedding": vec,
             })
             chunk_id += 1

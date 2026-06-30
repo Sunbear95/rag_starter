@@ -4,74 +4,95 @@
 
 ## 한 줄 요약
 
-청킹 품질 개선 + 인덱스 빌드 + 답변별 **토큰 사용량 및 소요 시간** 표시 추가. 코드·인덱스 준비 완료, 바로 실행 가능.
+코퍼스가 **항공규정 14 CFR PDF 6종**으로 교체됨에 따라, 깨져 있던 수집 파이프라인을
+**PDF 추출 + § 섹션 인식 청킹**으로 새로 구현. 청킹/파싱은 vol1(969p) 포함 전 문서에서
+검증 완료(총 4,777 청크). **임베딩 빌드만 egress 정책으로 보류 중** (아래 블로커 참고).
 
 ---
 
-## 직접 수정한 소스 파일 (4개)
+## 배경: 왜 고쳤나
 
-### 1. `indexer.py` — `chunk_text()` 개선
-- **breadcrumb 프리픽스**: 각 청크 앞에 `문서제목 > 섹션제목`을 붙임 (예: `Apollo 11 > Lunar surface operations`). 본문에 미션명이 없어도 임베딩/컨텍스트에 맥락이 실려 미션명 기반 질의 매칭이 좋아짐.
-- **섹션 인식 청킹**: 위키 추출본의 섹션 제목(짧은 단독 라인)을 감지해 섹션 경계에서 청크를 나눔.
-- **문장 경계 overlap**: 기존 `current[-100:]` 단순 컷 → 문장/단어 경계에 스냅.
-- 보조 함수 추가: `_looks_like_heading()`, `_overlap_tail()`, `_doc_title()`.
-- `build_index()`가 문서 제목(첫 `# H1`)을 뽑아 `chunk_text(doc_title=...)`로 전달.
+- 직전 커밋(`update documents`)에서 `documents/`가 Apollo 위키 `.md` → CFR `.pdf` 6종으로 교체됨.
+- 그런데 `indexer.build_index()`는 `.md`/`.txt`만 처리 → **PDF는 전부 스킵 → 청크 0개**.
+  즉 어떤 질문에도 "sources don't contain an answer"만 나오는 상태였음.
+- 기존 청킹은 위키 짧은 제목 줄(`_looks_like_heading`)에 맞춰져 CFR의 `§ 61.1`,
+  `Subpart A` 구조와 안 맞음.
 
-### 2. `backend/app.py` — 토큰 사용량 + 소요 시간 응답 추가
-- `/api/chat` 응답에 `usage` 필드 추가: `{input_tokens, output_tokens, total_tokens}` (`resp.usage`에서 추출).
-- `/api/chat` 응답에 `latency_ms` 필드 추가: `time.perf_counter()`로 요청 시작~응답까지(검색 + LLM 호출) end-to-end 측정. `import time` 추가.
-- 검색 `k`는 현재 **5** (기본값). 토큰/재현율 트레이드오프 검토거리.
+## 직접 수정한 소스 파일
 
-### 3. `frontend/src/App.jsx` — 토큰 + 시간 표시
-- 응답에서 `usage`와 `latency_ms`를 받아 메시지 상태에 저장.
-- 각 assistant 답변 아래 `Tokens: N (in X / out Y) · 1.23s` 형식으로 표시.
+### 1. `indexer.py` — CFR PDF 수집 파이프라인 신설
+- **컬럼 분할 추출**: CFR은 2단 레이아웃이라 단순 추출 시 좌/우 컬럼이 줄 단위로 섞임.
+  페이지를 좌/우 절반으로 crop해 각 컬럼을 위→아래로 읽어 순서 복원 (pdfplumber).
+- **헤더/푸터 제거**: 상·하단 밴드 crop + 러닝 헤더(`Federal Aviation Administration…`,
+  `… CFR … Edition`, `VerDate…`) 정규식 제거.
+- **텍스트 클린업**: 줄바꿈 하이픈 결합(`certifi-\ncate` → `certificate`), 줄바꿈→공백,
+  Federal-Register 개정이력(`[… FR …]`)·`EFFECTIVE DATE NOTE` 노이즈 제거.
+- **§ 섹션 인식 청킹**: `PART N—`, `Subpart X—`, `§ N.M Title.` 구조를 파싱.
+  각 청크 앞에 `14 CFR Part 61 > Subpart A—General > § 61.1 Applicability and definitions`
+  breadcrumb를 붙여 규정 구조를 임베딩·컨텍스트에 함께 실음.
+- **TOC 중복 제거**: 각 Part 앞 목차가 섹션 제목을 중복 나열 → `(part, section)`별 본문이
+  가장 긴 항목만 유지.
+- **메타데이터 추가**: 레코드에 `part`, `subpart`, `section`(§ 번호), `section_title`,
+  `page`(인쇄 페이지번호) 부착 → 추후 "차원2: 인용·근거"에서 `§ 91.113` 단위 인용에 사용.
+- **긴 섹션 분할**: target ~1200자, overlap ~150자, 문장 경계 스냅.
+- `.md`/`.txt` 범용 청커는 그대로 유지(자기 코퍼스 교체용).
 
-### 4. `frontend/src/index.css` — 표시 스타일
-- `.usage` 클래스 추가 (작은 회색 모노스페이스, 기존 `.sources` 톤에 맞춤). 토큰·시간 한 줄에 같이 표시.
-
----
-
-## 삭제한 파일 (1개)
-
-- `documents/06-changelog.md` — Apollo가 아니라 습관 추적 앱 changelog. 스타터 템플릿 잔재(다른 세션 영향 아님). 검색 노이즈라 제거 → 현재 Apollo 문서 정확히 20개.
-
----
-
-## 자동 생성/부산물 (신경 안 써도 됨)
-
-- `index.pkl` — 인덱스 빌드 결과 (1100 청크, 4.6MB)
-- `__pycache__/`, `backend/__pycache__/` — 파이썬 캐시
-- `frontend/package-lock.json` — `npm install` 부산물
-- `.claude/settings.local.json` — 에이전트 설정
+### 2. `backend/requirements.txt`
+- `pdfplumber>=0.11` 추가.
 
 ---
 
-## 현재 환경 상태
+## 검증 결과 (임베딩 스텁, 파싱/청킹 로직)
 
-- `.venv` 생성됨 (python3.11), `backend/requirements.txt` 설치 완료.
-- 임베딩 모델 다운로드 완료, `index.pkl` 빌드 완료 (1100 청크).
-- API 키: 별도 `.env` 없이 `~/ksept-lab/.env`의 `ANTHROPIC_API_KEY`를 `load_dotenv()`가 상위 탐색으로 자동 로드함.
+빌드를 임베딩만 더미 벡터로 대체해 추출·파싱·청킹·스키마를 전수 검증:
+
+| 문서 | 청크 |
+|---|---|
+| vol1 (969p, Part 1–59) | 3,509 |
+| vol2-part61 | 520 |
+| vol2-part67 | 64 |
+| vol2-part71 | 21 |
+| vol2-part73 | 14 |
+| vol2-part91 | 649 |
+| **합계** | **4,777** |
+
+- 4,777/4,777 청크 전부 `section` + `page` 메타데이터 보유.
+- vol1 샘플: `§ 26.21 | part 26 | page 483 | Limit of validity` — Part/섹션/페이지 정확.
+- 추출 소요 ~187초 (오프라인 1회성).
+
+---
+
+## ⛔ 현재 블로커: 임베딩 모델 다운로드
+
+- `index.pkl`를 실제로 빌드하려면 임베딩 모델
+  (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`)을
+  HuggingFace에서 받아야 함.
+- 이 세션의 egress 정책이 **`huggingface.co`를 차단(403)** → 모델 다운로드 불가.
+  (정책 거부는 우회 금지 → 보고 대상.)
+- **해소 방법**: 환경 네트워크 정책에서 `huggingface.co`(및 `cdn-lfs*.huggingface.co`)를
+  허용하거나, 모델 캐시를 환경에 미리 심어두면 `python indexer.py`로 즉시 빌드 가능.
+- 모델만 준비되면 코드 변경 없이 빌드가 통과하도록 검증해 둠.
 
 ## 실행 방법
 
 ```bash
-# 백엔드 (터미널 1)
-cd ~/ksept-lab/rag-starter && source .venv/bin/activate && cd backend && python app.py
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r backend/requirements.txt
+python indexer.py            # huggingface.co 접근 필요 (위 블로커)
 
-# 프론트엔드 (터미널 2)
-cd ~/ksept-lab/rag-starter/frontend && npm install && npm run dev
-# http://localhost:5173
+# 백엔드 / 프론트엔드
+cd backend && python app.py
+cd frontend && npm install && npm run dev   # http://localhost:5173
 ```
 
-> curl 테스트 시 `localhost` 대신 `127.0.0.1` 사용 (Flask가 IPv4에만 바인딩).
+## 남은 일 / 다음 개선 차원
 
-## 검증 결과 (참고)
+수집(차원0)은 코드 완료. 모델 접근만 풀리면 빌드·검색 검증 후 아래로 진행:
 
-- "Apollo 1 화재 원인" → 정확, 출처 `apollo-01.md`.
-- "어느 미션이 달에 착륙했나" → usage in=1432/out=180, latency≈9.5s (k=5 기준).
-- "11호 vs 17호 moonwalk 비교" → **약함**: 단일 벡터 검색에서 두 엔티티가 희석돼 11/17이 안 잡힘. (보고서의 "실패 사례"로 적합)
-
-## 남은 일 / 검토거리
-
-- 검색 `k` 값 튜닝 (토큰 비용 ↔ 재현율).
-- README 4·"What to present" 항목용 보고서 작성: 테스트 질문 5개, 강점 2/약점 2, 청킹 선택 근거, 실패 사례 + 개선책.
+- **answer quality**: 하이브리드 검색(BM25+벡터), 리랭커, 멀티엔티티 질의 분해, 모델 ID 정정
+  (`app.py`의 `claude-sonnet-4-6`는 실제 ID 아님).
+- **citations & grounding**: `§` 번호+페이지 기반 인용(메타데이터 이미 준비됨), 근거 검증.
+- **cost management**: 프롬프트 캐싱, 모델 티어링, 동적 k.
+- **clarity**: 스트리밍, 답변 구조화.
+- **robustness & safety**: `/api/chat` 에러 처리·입력 검증, 빈 결과 가드, 규제 도메인 디스클레이머.
+- **user experience**: 멀티턴 히스토리(현재 단발성), 출처 미리보기.
