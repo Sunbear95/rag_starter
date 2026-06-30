@@ -53,6 +53,7 @@ h1 {
 
 form {
   display: flex;
+  align-items: center;
   gap: 0.5rem;
 }
 
@@ -65,6 +66,7 @@ input {
   outline: none;
 }
 input:focus { border-color: #0066cc; }
+input:disabled { background: #f2f2f5; color: #999; }
 
 button {
   padding: 0.6rem 1.2rem;
@@ -76,3 +78,19 @@ button {
   cursor: pointer;
 }
 button:hover { background: #0055aa; }
+button:disabled { background: #9bbfe0; cursor: default; }
+
+/* Live time/token indicator beside the chat input. */
+.indicator {
+  flex: none;
+  min-width: 11rem;
+  text-align: right;
+  font-size: 0.8rem;
+  color: #999;
+  font-family: ui-monospace, Menlo, monospace;
+  white-space: nowrap;
+}
+.indicator-live {
+  color: #0066cc;
+  font-variant-numeric: tabular-nums;
+}
