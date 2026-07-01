@@ -45,7 +45,7 @@ export default function App() {
     setInput('')
     setLoading(true)
     startTimer()
-    setMessages((m) => [...m, { role: 'assistant', text: '', citations: [], toolCalls: [], usage: null, latencyMs: null }])
+    setMessages((m) => [...m, { role: 'assistant', text: '', citations: [], retrieved: [], toolCalls: [], usage: null, latencyMs: null }])
 
     try {
       const res = await fetch('/api/chat', {
@@ -95,6 +95,7 @@ export default function App() {
           } else if (event.type === 'done') {
             patchLastMessage(() => ({
               citations: event.citations || [],
+              retrieved: event.retrieved || [],
               usage: event.usage || null,
               latencyMs: event.latency_ms ?? null,
             }))
@@ -187,6 +188,23 @@ export default function App() {
                   {m.latencyMs != null && `${(m.latencyMs / 1000).toFixed(2)}s`}
                 </div>
               )}
+              {m.retrieved && m.retrieved.length > 0 && (() => {
+                const cited = new Set((m.citations || []).map((c) => c.n))
+                return (
+                  <details className="retrieved">
+                    <summary>Retrieved chunks ({m.retrieved.length})</summary>
+                    {m.retrieved.map((r) => (
+                      <div key={r.n} className={`rchunk ${cited.has(r.n) ? 'rchunk-cited' : ''}`}>
+                        <div className="rchunk-head">
+                          <span className="rchunk-n">[{r.n}]</span> {r.source} · chunk #{r.chunk_index}
+                          {cited.has(r.n) && <span className="rchunk-badge">cited</span>}
+                        </div>
+                        <div className="rchunk-text">{r.text}</div>
+                      </div>
+                    ))}
+                  </details>
+                )
+              })()}
             </div>
           ))}
         </div>

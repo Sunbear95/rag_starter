@@ -190,7 +190,7 @@ def chat():
         # NDJSON protocol: one JSON object per line.
         #   {"type": "delta", "text": "..."}                                     — repeated
         #   {"type": "tool_call", "query": "...", "result_count": N}             — repeated
-        #   {"type": "done", "citations": [...], "usage": {...}, "latency_ms": N} — success, terminal
+        #   {"type": "done", "citations": [...], "retrieved": [...], "usage": {...}, "latency_ms": N} — success, terminal
         #   {"type": "error", "message": "..."}                                  — failure, terminal
         # By the time this generator runs, Flask has already sent a 200 with
         # chunked headers, so a mid-stream failure can't become an HTTP error
@@ -289,10 +289,23 @@ def chat():
             return
 
         citations = _build_citations(final_answer_text, all_hits)
+        # Every chunk retrieved this turn across all search_cfr calls (numbered to
+        # match the [n] markers), so the UI can show exactly what was retrieved —
+        # not just what got cited.
+        retrieved = [
+            {
+                "n": i + 1,
+                "source": h["source"],
+                "chunk_index": h["chunk_index"],
+                "text": h["text"],
+            }
+            for i, h in enumerate(all_hits)
+        ]
         usage = {**usage_totals, "total_tokens": usage_totals["input_tokens"] + usage_totals["output_tokens"]}
         yield json.dumps({
             "type": "done",
             "citations": citations,
+            "retrieved": retrieved,
             "usage": usage,
             "latency_ms": round((time.perf_counter() - t0) * 1000),
         }) + "\n"

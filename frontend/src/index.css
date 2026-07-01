@@ -215,6 +215,59 @@ body {
   font-family: ui-monospace, Menlo, monospace;
 }
 
+/* Collapsible panel: all chunks retrieved as context for this answer */
+.retrieved { margin-top: 0.5rem; }
+.retrieved > summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--faa-blue-ink);
+  padding: 0.25rem 0;
+  list-style: none;
+}
+.retrieved > summary::-webkit-details-marker { display: none; }
+.retrieved > summary::before { content: '▸ '; }
+.retrieved[open] > summary::before { content: '▾ '; }
+.rchunk {
+  margin-top: 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.rchunk-cited { border-color: var(--faa-blue); }
+.rchunk-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  background: #eef2f7;
+  border-bottom: 1px solid var(--line);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.rchunk-n { color: var(--faa-blue-ink); font-weight: 700; }
+.rchunk-badge {
+  margin-left: auto;
+  padding: 0.02rem 0.4rem;
+  background: var(--faa-blue);
+  color: #fff;
+  border-radius: 3px;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.rchunk-text {
+  padding: 0.6rem 0.75rem;
+  max-height: 14rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
 /* ── Input form ───────────────────────────────────────────── */
 form { display: flex; align-items: center; gap: 0.5rem; }
 input {
