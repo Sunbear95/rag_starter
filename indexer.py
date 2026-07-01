@@ -582,6 +582,105 @@ def search(
     return kept or [deduped[0][1]]
 
 
+# ════════════════════════════════════════════════════════════════
+# Structured lookups — exact section/part access, no embedding needed
+# ════════════════════════════════════════════════════════════════
+
+def _normalize_section(s: str) -> str:
+    """Reduce any section reference to its bare number for matching.
+
+    '§ 91.119', '91.119', 'Sec. 91.119', '§91.119(b)' -> '91.119'.
+    """
+    m = re.search(r"(\d+[A-Za-z]?\.\d+[A-Za-z0-9\-]*)", s or "")
+    return m.group(1) if m else (s or "").strip()
+
+
+def _section_sort_key(sec: str) -> tuple:
+    m = re.search(r"(\d+)\.(\d+)([A-Za-z0-9\-]*)", sec or "")
+    if not m:
+        return (10**9, 10**9, "")
+    return (int(m.group(1)), int(m.group(2)), m.group(3))
+
+
+def _chunk_body(text: str) -> str:
+    """Strip the breadcrumb prefix, returning just the passage body."""
+    return text.split("\n\n", 1)[-1].strip()
+
+
+def _merge_overlapping(bodies: list[str]) -> str:
+    """Join a section's chunk bodies back into one passage, removing the
+    fixed overlap the chunker carries between consecutive chunks."""
+    out = ""
+    for b in bodies:
+        b = b.strip()
+        if not b:
+            continue
+        if not out:
+            out = b
+            continue
+        # Largest k such that the accumulated text ends with the next body's
+        # first k chars — that's the carried-over overlap, drop it once.
+        maxk = min(len(out), len(b), OVERLAP_CHARS * 3)
+        k = next((c for c in range(maxk, 20, -1) if out.endswith(b[:c])), 0)
+        out += b[k:]
+    return out
+
+
+def get_section(records: list[dict], section: str, max_chars: int = 6000) -> dict | None:
+    """Reassemble the full text of one CFR section from its chunks.
+
+    Returns None if no section matches. Caps the body at `max_chars` so a
+    pathologically long section can't blow up the context window.
+    """
+    norm = _normalize_section(section)
+    if not norm:
+        return None
+    hits = sorted(
+        (r for r in records if _normalize_section(r.get("section") or "") == norm),
+        key=lambda r: (r.get("source", ""), r["chunk_index"]),
+    )
+    if not hits:
+        return None
+    body = _merge_overlapping([_chunk_body(r["text"]) for r in hits])
+    truncated = len(body) > max_chars
+    if truncated:
+        body = body[:max_chars].rsplit(" ", 1)[0] + " …[truncated — use search_cfr for the remainder]"
+    first = hits[0]
+    pages = sorted({r.get("page") for r in hits if r.get("page")})
+    return {
+        "section": first.get("section"),
+        "section_title": first.get("section_title"),
+        "part": first.get("part"),
+        "source": first.get("source"),
+        "page": pages[0] if pages else None,
+        "chunk_index": first["chunk_index"],
+        "chunk_ids": [r["chunk_id"] for r in hits],
+        "text": body,
+        "n_chunks": len(hits),
+        "truncated": truncated,
+    }
+
+
+def list_sections(records: list[dict], part: str, limit: int = 200) -> dict:
+    """List the (section, title) pairs within a CFR Part, in section order."""
+    p = _normalize_section(part) or str(part).strip().lstrip("Part ").strip()
+    # A part reference may itself be a bare number ("67") or embedded in a
+    # section number ("67.103" -> part 67); match on the leading part digits.
+    p = re.match(r"\d+", p)
+    p = p.group(0) if p else str(part).strip()
+    seen: dict[str, str] = {}
+    for r in records:
+        if str(r.get("part") or "") != p:
+            continue
+        sec = r.get("section")
+        if not sec or sec in seen:
+            continue
+        seen[sec] = r.get("section_title") or ""
+    items = sorted(seen.items(), key=lambda kv: _section_sort_key(kv[0]))
+    total = len(items)
+    return {"part": p, "total": total, "items": items[:limit], "truncated": total > limit}
+
+
 def main() -> None:
     print(f"Indexing documents from {DOCS_DIR}/")
     records = build_index()

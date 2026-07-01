@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
-from indexer import load_index, search
+from indexer import _normalize_section, get_section, list_sections, load_index, search
 
 load_dotenv()  # ANTHROPIC_API_KEY (and friends) from .env
 
@@ -43,9 +43,19 @@ print(f"Loaded {len(INDEX)} chunks from disk")
 
 
 SYSTEM_PROMPT = """You are a helpful assistant that answers questions about the 14 CFR \
-(Federal Aviation Regulations). You do not have the regulations memorized — you have a \
-`search_cfr` tool that searches the indexed corpus. Use it to find grounding passages \
-before answering; never answer from outside/prior knowledge.
+(Federal Aviation Regulations). You do not have the regulations memorized — you have tools \
+that search and read the indexed corpus. Use them to find grounding passages before \
+answering; never answer from outside/prior knowledge.
+
+Tools — pick the cheapest one that fits:
+- `search_cfr`: semantic + keyword search when you don't yet know which section covers \
+the topic. Your default starting point.
+- `get_section`: once you know the exact section number (from a search hit or the user \
+naming it), fetch its complete verbatim text in one call instead of stitching fragments \
+together with repeated searches. Prefer this for "what does § X require" / full-text asks.
+- `list_sections`: to see a Part's structure or answer enumeration questions ("what does \
+Part 91 cover") cheaply — it returns a section directory, not passage text, so follow up \
+with get_section or search_cfr for anything you need to quote or cite.
 
 Search strategy:
 - Call `search_cfr` at least once before answering. Call it again with a different, more \
@@ -163,6 +173,49 @@ SEARCH_TOOL = {
     },
 }
 
+GET_SECTION_TOOL = {
+    "name": "get_section",
+    "description": (
+        "Fetch the complete verbatim text of one specific CFR section by its number "
+        "(e.g. '§ 91.119' or '91.119'). Use this — not search_cfr — once you know the "
+        "exact section you need, to get the whole section reassembled from its chunks "
+        "instead of scattered fragments. Returns one numbered passage you can cite as [n]."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "section": {
+                "type": "string",
+                "description": "A CFR section number, e.g. '91.119', '§ 91.119', or '61.23'.",
+            },
+        },
+        "required": ["section"],
+    },
+}
+
+LIST_SECTIONS_TOOL = {
+    "name": "list_sections",
+    "description": (
+        "List the section numbers and titles contained in a CFR Part (e.g. '91' or "
+        "'67'). Use this to see a Part's structure or to answer enumeration questions "
+        "('what does Part X cover') cheaply, without pulling full passage text. Returns "
+        "a directory, not citable content — follow up with get_section or search_cfr for "
+        "the actual regulatory text."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "part": {
+                "type": "string",
+                "description": "A CFR Part number, e.g. '91', '67', or '61'.",
+            },
+        },
+        "required": ["part"],
+    },
+}
+
+TOOLS = [SEARCH_TOOL, GET_SECTION_TOOL, LIST_SECTIONS_TOOL]
+
 # Hard cap on model↔tool round-trips per user turn: bounds worst-case cost/latency
 # for one question to at most this many Anthropic API calls. The last iteration is
 # always run without the tool available, which forces a text answer and guarantees
@@ -278,7 +331,7 @@ def chat():
                     messages=messages,
                     # Tools stay in the request on *every* iteration so the cached
                     # prefix (tools + system + prior turns) doesn't change shape.
-                    tools=[SEARCH_TOOL],
+                    tools=TOOLS,
                 )
                 # Final iteration forbids tool use rather than dropping the tool:
                 # this still forces a text answer and terminates the loop, but
@@ -303,28 +356,25 @@ def chat():
                 for block in final.content:
                     if block.type != "tool_use":
                         continue
-                    query = str(block.input.get("query", ""))
                     if search_count >= MAX_SEARCHES_PER_TURN:
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
-                            "content": "(Search limit reached for this turn — answer using "
+                            "content": "(Tool-call limit reached for this turn — answer using "
                                        "only the information already gathered above.)",
                         })
                         continue
                     search_count += 1
-                    results = search(query, INDEX, k=5)
-                    new_hits = [h for h in results if h["chunk_id"] not in seen_chunk_ids]
-                    for h in new_hits:
-                        seen_chunk_ids.add(h["chunk_id"])
-                        all_hits.append(h)
-
-                    start_num = len(all_hits) - len(new_hits) + 1
-                    content = (
-                        "\n\n".join(f"[{start_num + i}] {h['text']}" for i, h in enumerate(new_hits))
-                        if new_hits
-                        else "(No new results — matching passages were already shown above.)"
-                    )
+                    try:
+                        content, arg, result_count = _run_tool(block, all_hits, seen_chunk_ids)
+                    except Exception:
+                        # A bad argument or lookup failure must not kill the stream
+                        # (headers are already sent) — hand the error back as a tool
+                        # result so the model can recover with a different call.
+                        app.logger.exception("Tool %s failed", block.name)
+                        content, arg, result_count = (
+                            f"(The {block.name} tool failed for this input. "
+                            "Try a different query or tool.)", str(block.input), 0)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -333,8 +383,8 @@ def chat():
                     yield json.dumps({
                         "type": "tool_call",
                         "name": block.name,
-                        "query": query,
-                        "result_count": len(new_hits),
+                        "query": arg,
+                        "result_count": result_count,
                     }) + "\n"
 
                 # If the *next* iteration is the forced no-tool one, say so explicitly:
@@ -390,6 +440,70 @@ def chat():
         }) + "\n"
 
     return Response(generate(), mimetype="application/x-ndjson")
+
+
+def _run_tool(block, all_hits: list[dict], seen_chunk_ids: set) -> tuple[str, str, int]:
+    """Execute one tool_use block and return (tool_result_text, arg_shown, result_count).
+
+    Content-returning tools append their citable passages to `all_hits` (numbered
+    to match the [n] markers in the returned text) and record their ids in
+    `seen_chunk_ids` so a repeat call this turn doesn't double-add them.
+    """
+    name = block.name
+
+    if name == "search_cfr":
+        query = str(block.input.get("query", ""))
+        results = search(query, INDEX, k=5)
+        new_hits = [h for h in results if h["chunk_id"] not in seen_chunk_ids]
+        for h in new_hits:
+            seen_chunk_ids.add(h["chunk_id"])
+            all_hits.append(h)
+        start_num = len(all_hits) - len(new_hits) + 1
+        content = (
+            "\n\n".join(f"[{start_num + i}] {h['text']}" for i, h in enumerate(new_hits))
+            if new_hits
+            else "(No new results — matching passages were already shown above.)"
+        )
+        return content, query, len(new_hits)
+
+    if name == "get_section":
+        arg = str(block.input.get("section", ""))
+        sec = get_section(INDEX, arg)
+        if not sec:
+            return f"(No section matching '{arg}' found in the corpus.)", arg, 0
+        marker = f"section:{_normalize_section(sec['section'] or arg)}"
+        if marker in seen_chunk_ids:
+            n = next((i + 1 for i, h in enumerate(all_hits) if h.get("chunk_id") == marker), None)
+            return f"(Section {sec['section']} already provided above as [{n}].)", sec["section"] or arg, 0
+        seen_chunk_ids.add(marker)
+        all_hits.append({
+            "chunk_id": marker,
+            "source": sec["source"],
+            "chunk_index": sec["chunk_index"],
+            "part": sec["part"],
+            "section": sec["section"],
+            "section_title": sec["section_title"],
+            "page": sec["page"],
+            "text": f"{sec['section']} {sec['section_title']}\n\n{sec['text']}",
+        })
+        n = len(all_hits)
+        header = f"{sec['section']} — {sec['section_title']} (full section, {sec['n_chunks']} chunks)"
+        return f"[{n}] {header}\n\n{sec['text']}", sec["section"] or arg, 1
+
+    if name == "list_sections":
+        arg = str(block.input.get("part", ""))
+        res = list_sections(INDEX, arg)
+        if not res["items"]:
+            return f"(No sections found for Part '{arg}'.)", arg, 0
+        lines = "\n".join(f"{s} — {t}" if t else s for s, t in res["items"])
+        note = f"\n(Showing {len(res['items'])} of {res['total']} — truncated.)" if res["truncated"] else ""
+        content = (
+            f"Part {res['part']} contains {res['total']} sections:\n{lines}{note}\n\n"
+            "(Directory only — use get_section or search_cfr for the actual text.)"
+        )
+        return content, f"Part {res['part']}", res["total"]
+
+    return f"(Unknown tool: {name})", str(block.input), 0
 
 
 def _excerpt(text: str, limit: int = 280) -> str:
