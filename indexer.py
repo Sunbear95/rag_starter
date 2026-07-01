@@ -26,12 +26,19 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 # Multilingual (50+ languages), 384-dim — same model as the /embedding project.
 # Lets the corpus and the queries be in different languages and still match.
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# Cross-encoder reranker: scores each (query, chunk) pair jointly — far more
+# precise than the bi-encoder cosine recall, which can rank a loosely related
+# chunk above the one that actually answers the question. Used to re-order a
+# wide candidate pool down to the few chunks fed to the LLM. Ships with
+# sentence-transformers; downloads once (~80MB) on first use.
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 INDEX_PATH = Path(__file__).parent / "index.pkl"
 DOCS_DIR = Path(__file__).parent / "documents"
 
@@ -486,6 +493,42 @@ def _get_bm25(records: list[dict]) -> BM25Okapi:
     return bm25
 
 
+# Embedding matrix, cached per records-list identity (same lifecycle as the
+# BM25 cache). Stacking every chunk vector into one (N, D) array lets the dense
+# recall step score the whole corpus with a single matmul instead of a Python
+# loop over N cosine_distance() calls.
+_emb_matrix_cache: dict[int, np.ndarray] = {}
+
+
+def _get_emb_matrix(records: list[dict]) -> np.ndarray:
+    key = id(records)
+    m = _emb_matrix_cache.get(key)
+    if m is None:
+        m = np.asarray([r["embedding"] for r in records], dtype=np.float32)
+        _emb_matrix_cache[key] = m
+    return m
+
+
+# Cross-encoder reranker, lazy-loaded on first query so startup and the indexer
+# don't pay for a model the search path may never use.
+_reranker = None
+
+
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        from sentence_transformers import CrossEncoder
+        print(f"Loading reranker ({RERANK_MODEL})... (one-time download ~80MB)")
+        _reranker = CrossEncoder(RERANK_MODEL)
+    return _reranker
+
+
+def _rerank_scores(query: str, records: list[dict]) -> np.ndarray:
+    """Cross-encoder relevance logits for each (query, chunk) pair."""
+    scores = get_reranker().predict([(query, r["text"]) for r in records])
+    return np.asarray(scores, dtype=np.float32)
+
+
 # Cap on candidates considered per retriever before fusion. Keeps the fused
 # ranking to documents each retriever actually vouches for, and bounds the
 # fusion cost on a large corpus.
@@ -513,32 +556,43 @@ def search(
     records: list[dict],
     k: int = 5,
     relative_threshold: float = 0.5,
+    use_rerank: bool = True,
+    rerank_candidates: int | None = None,
 ) -> list[dict]:
-    """Hybrid search: fuse embedding similarity with BM25 keyword matching.
+    """Two-stage hybrid retrieval: recall with dense + lexical fusion, then
+    (optionally) rerank the pool with a cross-encoder for precision.
 
-    Vector search alone blurs the exact identifiers regulatory text leans on
-    (e.g. "§ 91.155", "Part 61") since embeddings capture semantic similarity,
-    not exact tokens. BM25 catches those verbatim; the two rankings are
-    combined with Reciprocal Rank Fusion so neither score scale has to be
-    normalized against the other.
+    Stage 1 — recall. Vector search alone blurs the exact identifiers
+    regulatory text leans on (e.g. "§ 91.155", "Part 61") since embeddings
+    capture semantic similarity, not exact tokens. BM25 catches those verbatim;
+    the two rankings are combined with Reciprocal Rank Fusion so neither score
+    scale has to be normalized against the other. A section dedup keeps only the
+    higher-ranked of two near-duplicate chunks from the same (source, section),
+    since a long CFR section is split into overlapping chunks.
 
-    Two trims keep the context block lean (fewer tokens billed, less noise for
-    the model to synthesize over) without hurting recall:
+    Stage 2 — precision. RRF rank position is a coarse signal, so when
+    `use_rerank` is set the fused candidate pool (`rerank_candidates`, defaulting
+    to a multiple of `k`) is re-scored by a cross-encoder that reads each
+    (query, chunk) pair jointly, and the top `k` by that score are kept.
 
-      - Section dedup: a long CFR section gets split into overlapping chunks
-        ([indexer.py:_split_body]), so two top hits can be near-duplicate text
-        from the same (source, section). Keep only the higher-scoring one.
-      - Relevance gate: drop hits whose fused score is below
-        `relative_threshold` of the best hit's score — they're unlikely to be
-        worth their tokens. Always keeps at least the single best hit.
+    Relevance gate: scores are put on a [0, 1] scale (sigmoid of the
+    cross-encoder logit, or the fused score itself when reranking is off) and
+    hits below `relative_threshold` of the best hit are dropped — unlikely to be
+    worth their tokens. Always keeps at least the single best hit.
     """
     if not records:
         return []
 
-    [query_vec] = embed([query])
-    vector_ranking = sorted(
-        range(len(records)), key=lambda i: cosine_distance(records[i]["embedding"], query_vec)
-    )[:_RANKING_LIMIT]
+    n = len(records)
+    pool_size = (rerank_candidates or max(4 * k, 20)) if use_rerank else k
+
+    # ── Stage 1: dense recall (single matmul; embeddings are unit-normalized,
+    # so the dot product IS cosine similarity — higher is nearer). ──
+    query_vec = np.asarray(embed([query])[0], dtype=np.float32)
+    sims = _get_emb_matrix(records) @ query_vec
+    lim = min(_RANKING_LIMIT, n)
+    top = np.argpartition(-sims, lim - 1)[:lim]
+    vector_ranking = top[np.argsort(-sims[top])].tolist()
 
     # Only rank documents with actual keyword overlap (score > 0). Sorting
     # the full corpus here would give every zero-relevance document a rank
@@ -548,14 +602,14 @@ def search(
     # match (e.g. a section number) on the other retriever.
     bm25_scores = _get_bm25(records).get_scores(_tokenize(query))
     bm25_ranking = sorted(
-        (i for i in range(len(records)) if bm25_scores[i] > 0),
+        (i for i in range(n) if bm25_scores[i] > 0),
         key=lambda i: bm25_scores[i], reverse=True,
     )[:_RANKING_LIMIT]
 
     fused = _rrf_fuse([vector_ranking, bm25_ranking])
     order = sorted(fused, key=lambda i: fused[i], reverse=True)
 
-    deduped: list[tuple[float, dict]] = []
+    candidates: list[tuple[float, dict]] = []      # (fused_score, record)
     seen_sections: set[tuple[str, str]] = set()
     for idx in order:
         r = records[idx]
@@ -564,15 +618,24 @@ def search(
             continue
         if key is not None:
             seen_sections.add(key)
-        deduped.append((fused[idx], r))
-        if len(deduped) >= k:
+        candidates.append((fused[idx], r))
+        if len(candidates) >= pool_size:
             break
-
-    if not deduped:
+    if not candidates:
         return []
-    best = deduped[0][0]
-    kept = [r for score, r in deduped if score >= best * relative_threshold]
-    return kept or [deduped[0][1]]
+
+    # ── Stage 2: cross-encoder rerank the pool down to the top k. ──
+    if use_rerank and len(candidates) > 1:
+        recs = [r for _, r in candidates]
+        probs = 1.0 / (1.0 + np.exp(-_rerank_scores(query, recs)))   # sigmoid → [0, 1]
+        ranked = sorted(zip(probs.tolist(), recs), key=lambda p: p[0], reverse=True)
+    else:
+        ranked = sorted(candidates, key=lambda p: p[0], reverse=True)
+
+    top_k = ranked[:k]
+    best = top_k[0][0]
+    kept = [r for score, r in top_k if score >= best * relative_threshold]
+    return kept or [top_k[0][1]]
 
 
 # ════════════════════════════════════════════════════════════════

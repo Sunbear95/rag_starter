@@ -102,6 +102,7 @@ export default function App() {
               citations: event.citations || [],
               retrieved: event.retrieved || [],
               usage: event.usage || null,
+              toolLimited: event.tool_limited || false,
               latencyMs: event.latency_ms ?? null,
             }))
             setLastStats({ usage: event.usage || null, latencyMs: event.latency_ms ?? null })
@@ -137,6 +138,16 @@ export default function App() {
     }, {})
   )
 
+  // Per-tool presentation: icon and the unit each call's result count is in
+  // (search returns passages, get_section a full section, list_sections a
+  // directory of sections). Falls back to a generic wrench for unknown tools.
+  const TOOL_META = {
+    search_cfr: { icon: '🔍', unit: 'result' },
+    get_section: { icon: '📄', unit: 'section' },
+    list_sections: { icon: '📑', unit: 'section' },
+  }
+  const toolMeta = (name) => TOOL_META[name] || { icon: '🔧', unit: 'result' }
+
   return (
     <div className="page">
       <header className="faa-header">
@@ -157,15 +168,23 @@ export default function App() {
         <div className="retrieval-body">
           {lastAssistant?.toolCalls && lastAssistant.toolCalls.length > 0 && (
             <div className="retrieval-group">
-              <div className="retrieval-title">Search keywords</div>
+              <div className="retrieval-title">Tool calls</div>
               <div className="tool-calls">
-                {lastAssistant.toolCalls.map((t, ti) => (
-                  <div key={ti} className="tool-call">
-                    🔍 <em>{t.query}</em>
-                    {t.resultCount > 0 ? ` (${t.resultCount} new result${t.resultCount === 1 ? '' : 's'})` : ' (no new results)'}
-                  </div>
-                ))}
+                {lastAssistant.toolCalls.map((t, ti) => {
+                  const meta = toolMeta(t.name)
+                  return (
+                    <div key={ti} className="tool-call">
+                      {meta.icon} <code className="tool-name">{t.name}</code> <em>{t.query}</em>
+                      {t.resultCount > 0
+                        ? ` (${t.resultCount} ${meta.unit}${t.resultCount === 1 ? '' : 's'})`
+                        : ' (no new results)'}
+                    </div>
+                  )
+                })}
               </div>
+              {lastAssistant?.toolLimited && (
+                <div className="tool-limit-flag">⚠ hit the per-question tool-call limit — answered from what was gathered</div>
+              )}
             </div>
           )}
 

@@ -26,6 +26,9 @@ from indexer import _normalize_section, get_section, list_sections, load_index, 
 load_dotenv()  # ANTHROPIC_API_KEY (and friends) from .env
 
 DEBUG = os.environ.get("FLASK_DEBUG", "").strip().lower() in ("1", "true", "yes")
+# Two-stage retrieval (cross-encoder rerank) is on by default; set USE_RERANK=0
+# to fall back to fusion-only recall (faster, no reranker model download).
+USE_RERANK = os.environ.get("USE_RERANK", "1").strip().lower() not in ("0", "false", "no")
 # Comma-separated allowlist. An explicitly empty value locks the API down
 # entirely (fail-safe), rather than falling back to "allow everything".
 CORS_ORIGINS = [
@@ -157,6 +160,12 @@ SEARCH_TOOL = {
                 "description": "A focused natural-language search query for one specific "
                                 "piece of information (not the whole user question verbatim).",
             },
+            "max_results": {
+                "type": "integer",
+                "description": "How many passages to return (3-10). Ask for fewer (3) on a "
+                                "narrow single-fact question, more (8-10) when surveying a "
+                                "broad topic. Defaults to 5.",
+            },
         },
         "required": ["query"],
     },
@@ -230,8 +239,9 @@ class RateLimiter:
     distributed deployment. `request.remote_addr` is the immediate TCP peer,
     so behind a reverse proxy every client would collapse onto one bucket;
     fixing that means trusting `X-Forwarded-For` from a known proxy, which is
-    out of scope here. Inactive IPs are never evicted from `_hits`, so memory
-    grows slowly over the life of the process — acceptable for a dev server.
+    out of scope here. Buckets that fall fully outside the window are evicted on
+    a periodic sweep, so `_hits` stays bounded by the active-IP count rather than
+    growing with every IP ever seen.
     """
 
     def __init__(self, max_requests: int, window_seconds: float):
@@ -239,12 +249,25 @@ class RateLimiter:
         self.window_seconds = window_seconds
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
+        self._calls_since_sweep = 0
+
+    def _sweep(self, cutoff: float) -> None:
+        """Drop buckets with no hits inside the window. Caller holds the lock."""
+        stale = [key for key, q in self._hits.items() if not q or q[-1] < cutoff]
+        for key in stale:
+            del self._hits[key]
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()  # immune to wall-clock adjustments (NTP, DST)
         with self._lock:
-            q = self._hits[key]
             cutoff = now - self.window_seconds
+            # Amortized cleanup: sweep every N calls so an ever-changing set of
+            # client IPs can't leak memory unboundedly.
+            self._calls_since_sweep += 1
+            if self._calls_since_sweep >= 1000:
+                self._calls_since_sweep = 0
+                self._sweep(cutoff)
+            q = self._hits[key]
             while q and q[0] < cutoff:
                 q.popleft()
             if len(q) >= self.max_requests:
@@ -425,6 +448,10 @@ def chat():
             "citations": citations,
             "retrieved": retrieved,
             "usage": usage,
+            "tool_calls": search_count,
+            # True when the model hit the per-turn tool budget and had to answer
+            # from what it already had — surfaced so the UI can flag it.
+            "tool_limited": search_count >= MAX_SEARCHES_PER_TURN,
             "latency_ms": round((time.perf_counter() - t0) * 1000),
         }) + "\n"
 
@@ -442,7 +469,13 @@ def _run_tool(block, all_hits: list[dict], seen_chunk_ids: set) -> tuple[str, st
 
     if name == "search_cfr":
         query = str(block.input.get("query", ""))
-        results = search(query, INDEX, k=5)
+        # Adaptive depth: the model sizes the result set to the question, clamped
+        # to a sane band so a bad value can't starve or flood the context.
+        try:
+            k = max(3, min(10, int(block.input.get("max_results", 5))))
+        except (TypeError, ValueError):
+            k = 5
+        results = search(query, INDEX, k=k, use_rerank=USE_RERANK)
         new_hits = [h for h in results if h["chunk_id"] not in seen_chunk_ids]
         for h in new_hits:
             seen_chunk_ids.add(h["chunk_id"])

@@ -163,6 +163,24 @@ body {
   padding: 0.1rem 0;
 }
 .tool-call em { font-style: normal; color: var(--faa-blue-ink); }
+.tool-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-style: normal;
+  font-size: 0.72rem;
+  background: var(--faa-blue-wash, rgba(0, 40, 104, 0.06));
+  color: var(--faa-blue-ink);
+  padding: 0.02rem 0.28rem;
+  border-radius: 3px;
+}
+.tool-limit-flag {
+  font-size: 0.75rem;
+  color: #8a5a00;
+  background: #fff4e0;
+  border: 1px solid #f0d9a8;
+  border-radius: 4px;
+  padding: 0.3rem 0.45rem;
+  margin-top: 0.3rem;
+}
 
 /* Rendered markdown in assistant answers */
 .md > :first-child { margin-top: 0; }
