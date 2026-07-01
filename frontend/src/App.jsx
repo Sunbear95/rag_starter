@@ -6,6 +6,7 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [concise, setConcise] = useState(false) // ask the backend for shorter, cheaper answers
   const [elapsedMs, setElapsedMs] = useState(0)
   const [lastStats, setLastStats] = useState(null) // { usage, latencyMs } of the latest answer
   const timerRef = useRef(null)
@@ -49,7 +50,7 @@ export default function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question }),
+        body: JSON.stringify({ message: question, concise }),
       })
 
       if (!res.ok) {
@@ -236,6 +237,15 @@ export default function App() {
             autoFocus
             disabled={loading}
           />
+          <label className="concise-toggle" title="Short answers in Rocky's voice — fewer tokens">
+            <input
+              type="checkbox"
+              checked={concise}
+              onChange={(e) => setConcise(e.target.checked)}
+              disabled={loading}
+            />
+            Rocky 🪨
+          </label>
           <button type="submit" disabled={loading}>{loading ? '…' : 'Send'}</button>
         </form>
       </div>
