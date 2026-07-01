@@ -23,6 +23,7 @@ in your own corpus.
 import bisect
 import pickle
 import re
+from collections import defaultdict
 from pathlib import Path
 
 from rank_bm25 import BM25Okapi
@@ -485,14 +486,22 @@ def _get_bm25(records: list[dict]) -> BM25Okapi:
     return bm25
 
 
-def _rrf_fuse(rankings: list[list[int]], k: int = 60) -> list[float]:
-    """Reciprocal Rank Fusion: combine several best-first rank-orderings (each
-    a permutation of record indices) into one score per index. Avoids having
-    to normalize scores from incompatible scales (bounded cosine similarity
-    vs. BM25's unbounded, corpus-dependent scores) — only rank position
-    matters."""
-    n = len(rankings[0]) if rankings else 0
-    scores = [0.0] * n
+# Cap on candidates considered per retriever before fusion. Keeps the fused
+# ranking to documents each retriever actually vouches for, and bounds the
+# fusion cost on a large corpus.
+_RANKING_LIMIT = 100
+
+
+def _rrf_fuse(rankings: list[list[int]], k: int = 60) -> dict[int, float]:
+    """Reciprocal Rank Fusion over sparse rank-orderings.
+
+    Each ranking may be a different length and need not cover every record —
+    in particular, the BM25 ranking below only includes documents with actual
+    keyword overlap. An index absent from a ranking contributes 0 from that
+    retriever, rather than picking up a "free" rank position (and thus RRF
+    score) among documents it has literally zero relevance to. Returns a
+    score only for indices that appear in at least one ranking."""
+    scores: dict[int, float] = defaultdict(float)
     for ranking in rankings:
         for rank, idx in enumerate(ranking):
             scores[idx] += 1.0 / (k + rank + 1)
@@ -529,13 +538,22 @@ def search(
     [query_vec] = embed([query])
     vector_ranking = sorted(
         range(len(records)), key=lambda i: cosine_distance(records[i]["embedding"], query_vec)
-    )
+    )[:_RANKING_LIMIT]
 
+    # Only rank documents with actual keyword overlap (score > 0). Sorting
+    # the full corpus here would give every zero-relevance document a rank
+    # position too, and RRF can't tell "ranked last because barely relevant"
+    # apart from "ranked last because completely irrelevant" — letting a
+    # vector-similar-but-keyword-unrelated chunk outscore a genuine exact
+    # match (e.g. a section number) on the other retriever.
     bm25_scores = _get_bm25(records).get_scores(_tokenize(query))
-    bm25_ranking = sorted(range(len(records)), key=lambda i: bm25_scores[i], reverse=True)
+    bm25_ranking = sorted(
+        (i for i in range(len(records)) if bm25_scores[i] > 0),
+        key=lambda i: bm25_scores[i], reverse=True,
+    )[:_RANKING_LIMIT]
 
     fused = _rrf_fuse([vector_ranking, bm25_ranking])
-    order = sorted(range(len(records)), key=lambda i: fused[i], reverse=True)
+    order = sorted(fused, key=lambda i: fused[i], reverse=True)
 
     deduped: list[tuple[float, dict]] = []
     seen_sections: set[tuple[str, str]] = set()

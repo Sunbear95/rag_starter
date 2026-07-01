@@ -114,6 +114,12 @@ SEARCH_TOOL = {
 # the loop terminates.
 MAX_TOOL_ITERATIONS = 4
 
+# Hard cap on total search_cfr calls per turn, independent of MAX_TOOL_ITERATIONS:
+# a single iteration's response can contain several tool_use blocks at once
+# (the model calling the tool multiple times in parallel), so bounding
+# round-trips alone doesn't bound the number of actual searches performed.
+MAX_SEARCHES_PER_TURN = 10
+
 
 # Max prior turns (user+assistant messages) carried into the next request.
 # Keeps follow-up questions coherent without letting the transcript grow unbounded.
@@ -197,6 +203,7 @@ def chat():
         # status — it's reported as an "error" line instead.
         all_hits: list[dict] = []       # accumulated across every search_cfr call this turn
         seen_chunk_ids: set[int] = set()
+        search_count = 0                # total search_cfr calls this turn, across all iterations
         usage_totals = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
 
         def accumulate_usage(u):
@@ -244,6 +251,15 @@ def chat():
                     if block.type != "tool_use":
                         continue
                     query = str(block.input.get("query", ""))
+                    if search_count >= MAX_SEARCHES_PER_TURN:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": "(Search limit reached for this turn — answer using "
+                                       "only the information already gathered above.)",
+                        })
+                        continue
+                    search_count += 1
                     results = search(query, INDEX, k=5)
                     new_hits = [h for h in results if h["chunk_id"] not in seen_chunk_ids]
                     for h in new_hits:
