@@ -25,6 +25,7 @@ import pickle
 import re
 from pathlib import Path
 
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 # Multilingual (50+ languages), 384-dim — same model as the /embedding project.
@@ -140,6 +141,12 @@ _HEADER_LINES = [
 _FR_CITATION = re.compile(r"\[[^\]]*\bFR\b[^\]]*\]", re.S)
 # "EFFECTIVE DATE NOTE: ... effective <date>." trailing administrative notes.
 _EFFECTIVE_NOTE = re.compile(r"EFFECTIVE DATE NOTE:.*?effective[^.]*\.", re.S | re.I)
+# The running page header (the enclosing Subpart's name, e.g. "Fire Protection")
+# gets extracted with its internal spaces stripped and lands right after an FR
+# citation, right at the tail of a section's body — e.g. "...approved.]
+# FIREPROTECTION §27.853 ...". A single glued all-caps run this long never
+# occurs in normal CFR prose, so it's a safe tell for this specific artifact.
+_TRAILING_HEADER_NOISE = re.compile(r"\s+[A-Z]{8,}\s*$")
 
 
 def _clean(text: str) -> str:
@@ -209,7 +216,28 @@ _SUBPART_TITLE_TAIL = re.compile(r"\s+(?:[A-Z]{2,}|Sec)\b.*$")
 # A real § heading: number followed by a Title-case heading ending in a period.
 # Cross-references like "§61.3(b)" or "under §61.41 of this part" don't match
 # (no Title-case heading word after the number).
-_SECTION_RE = re.compile(r"§\s*(\d+\.\d+[a-z]?)\s+([A-Z][^.]{2,140}?\.)")
+# The terminating period must not be immediately followed by another
+# "<capital letter>." — that pattern means we're inside a two-letter
+# abbreviation like "U.S." or "F.A.A.", not at the title's real end, so the
+# (non-greedy, but period-tolerant) title keeps consuming past it instead of
+# truncating mid-abbreviation (e.g. "...category U").
+_SECTION_RE = re.compile(r"§\s*(\d+\.\d+[a-z]?)\s+([A-Z].{2,140}?\.(?![A-Z]\.))")
+# CFR volumes print every part's appendices together in one block after all the
+# numbered sections, not immediately after their own part. Appendices don't
+# match _SECTION_RE/_PART_RE/_SUBPART_RE, so without this boundary the last
+# section before that block would swallow the entire appendix block (and any
+# later parts' front matter) into its own body. The heading is normally
+# "APPENDIX A TO PART 25—...", but the table-of-contents page listing all of a
+# part's appendices gets extracted with its spacing torn apart ("APPENDIXA
+# TOPART25 APPENDIXB TOPART25 ..."), so match on the bare, case-sensitive
+# "APPENDIX" token (with an optional glued single-letter suffix) rather than
+# the full phrase — body prose only ever refers to "appendix" in lowercase.
+_APPENDIX_RE = re.compile(r"\bAPPENDIX[A-Z]{0,3}\b")
+# Every CFR volume ends with a "Finding Aids" back-matter block (title/chapter
+# index, agency lists, amendment-history tables) that isn't part of the
+# regulatory text at all. Without this boundary, whatever section happens to
+# be the last one matched swallows this entire (large, irrelevant) block.
+_FINDING_AIDS_RE = re.compile(r"\bFinding\s+Aids\b")
 
 
 def _most_recent(positions: list[tuple[int, object]], at: int) -> object | None:
@@ -235,6 +263,8 @@ def parse_cfr(full_text: str, page_spans: list[tuple[int, int]], source: str) ->
         [m.start() for m in sec_matches]
         + [p[0] for p in parts_pos]
         + [p[0] for p in subparts_pos]
+        + [m.start() for m in _APPENDIX_RE.finditer(full_text)]
+        + [m.start() for m in _FINDING_AIDS_RE.finditer(full_text)]
     )
     offsets = [s[0] for s in page_spans]
 
@@ -252,6 +282,7 @@ def parse_cfr(full_text: str, page_spans: list[tuple[int, int]], source: str) ->
         body = full_text[body_start:body_end]
         body = _FR_CITATION.sub("", body)
         body = _EFFECTIVE_NOTE.sub("", body)
+        body = _TRAILING_HEADER_NOISE.sub("", body)
         body = re.sub(r"\s{2,}", " ", body).strip()
 
         part = _most_recent(parts_pos, m.start())
@@ -426,12 +457,104 @@ def cosine_distance(a: list[float], b: list[float]) -> float:
     return 1.0 - sum(x * y for x, y in zip(a, b))
 
 
-def search(query: str, records: list[dict], k: int = 5) -> list[dict]:
-    """Embed the query, return top-k records by cosine distance."""
+# CFR section numbers ("91.155", "61.3") first, as a single token — splitting
+# on the "." would scatter them into common, low-signal digit tokens ("91",
+# "155") that BM25's IDF can't tell apart from any other number in the corpus.
+# "§" itself is dropped: every chunk's breadcrumb contains one, so it carries
+# no discriminating signal and its BM25 IDF goes sharply negative (present in
+# ~100% of docs), which distorted scores more than it helped.
+_TOKEN_RE = re.compile(r"\d+\.\d+[a-z]?|[a-z0-9]+")
+
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall(text.lower())
+
+
+# BM25 index, cached per records-list identity (records is loaded once at
+# startup and reused for every query, so building this lazily on first use
+# and keeping it around is equivalent to building it once upfront).
+_bm25_cache: dict[int, BM25Okapi] = {}
+
+
+def _get_bm25(records: list[dict]) -> BM25Okapi:
+    key = id(records)
+    bm25 = _bm25_cache.get(key)
+    if bm25 is None:
+        bm25 = BM25Okapi([_tokenize(r["text"]) for r in records])
+        _bm25_cache[key] = bm25
+    return bm25
+
+
+def _rrf_fuse(rankings: list[list[int]], k: int = 60) -> list[float]:
+    """Reciprocal Rank Fusion: combine several best-first rank-orderings (each
+    a permutation of record indices) into one score per index. Avoids having
+    to normalize scores from incompatible scales (bounded cosine similarity
+    vs. BM25's unbounded, corpus-dependent scores) — only rank position
+    matters."""
+    n = len(rankings[0]) if rankings else 0
+    scores = [0.0] * n
+    for ranking in rankings:
+        for rank, idx in enumerate(ranking):
+            scores[idx] += 1.0 / (k + rank + 1)
+    return scores
+
+
+def search(
+    query: str,
+    records: list[dict],
+    k: int = 5,
+    relative_threshold: float = 0.5,
+) -> list[dict]:
+    """Hybrid search: fuse embedding similarity with BM25 keyword matching.
+
+    Vector search alone blurs the exact identifiers regulatory text leans on
+    (e.g. "§ 91.155", "Part 61") since embeddings capture semantic similarity,
+    not exact tokens. BM25 catches those verbatim; the two rankings are
+    combined with Reciprocal Rank Fusion so neither score scale has to be
+    normalized against the other.
+
+    Two trims keep the context block lean (fewer tokens billed, less noise for
+    the model to synthesize over) without hurting recall:
+
+      - Section dedup: a long CFR section gets split into overlapping chunks
+        ([indexer.py:_split_body]), so two top hits can be near-duplicate text
+        from the same (source, section). Keep only the higher-scoring one.
+      - Relevance gate: drop hits whose fused score is below
+        `relative_threshold` of the best hit's score — they're unlikely to be
+        worth their tokens. Always keeps at least the single best hit.
+    """
+    if not records:
+        return []
+
     [query_vec] = embed([query])
-    scored = [(cosine_distance(r["embedding"], query_vec), r) for r in records]
-    scored.sort(key=lambda x: x[0])
-    return [r for _, r in scored[:k]]
+    vector_ranking = sorted(
+        range(len(records)), key=lambda i: cosine_distance(records[i]["embedding"], query_vec)
+    )
+
+    bm25_scores = _get_bm25(records).get_scores(_tokenize(query))
+    bm25_ranking = sorted(range(len(records)), key=lambda i: bm25_scores[i], reverse=True)
+
+    fused = _rrf_fuse([vector_ranking, bm25_ranking])
+    order = sorted(range(len(records)), key=lambda i: fused[i], reverse=True)
+
+    deduped: list[tuple[float, dict]] = []
+    seen_sections: set[tuple[str, str]] = set()
+    for idx in order:
+        r = records[idx]
+        key = (r["source"], r["section"]) if r["section"] else None
+        if key is not None and key in seen_sections:
+            continue
+        if key is not None:
+            seen_sections.add(key)
+        deduped.append((fused[idx], r))
+        if len(deduped) >= k:
+            break
+
+    if not deduped:
+        return []
+    best = deduped[0][0]
+    kept = [r for score, r in deduped if score >= best * relative_threshold]
+    return kept or [deduped[0][1]]
 
 
 def main() -> None:

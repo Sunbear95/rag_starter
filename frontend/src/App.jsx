@@ -23,33 +23,89 @@ export default function App() {
     }
   }
 
+  // Applies an update fn to just the last message in state (the in-flight
+  // assistant placeholder). Safe because the form stays disabled — no other
+  // message can be appended — between the placeholder push and stream end.
+  function patchLastMessage(update) {
+    setMessages((m) => {
+      const next = [...m]
+      next[next.length - 1] = { ...next[next.length - 1], ...update(next[next.length - 1]) }
+      return next
+    })
+  }
+
   async function send(e) {
     e.preventDefault()
     if (!input.trim() || loading) return
 
     const question = input
+    // Last few turns only, to keep request size (and cost) bounded.
+    const history = messages.slice(-8).map((m) => ({ role: m.role, text: m.text }))
     setMessages((m) => [...m, { role: 'user', text: question }])
     setInput('')
     setLoading(true)
     startTimer()
+    setMessages((m) => [...m, { role: 'assistant', text: '', citations: [], toolCalls: [], usage: null, latencyMs: null }])
 
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question }),
+        body: JSON.stringify({ message: question, history }),
       })
-      const data = await res.json()
-      setMessages((m) => [...m, {
-        role: 'assistant',
-        text: data.reply,
-        citations: data.citations || [],
-        usage: data.usage || null,
-        latencyMs: data.latency_ms ?? null,
-      }])
-      setLastStats({ usage: data.usage || null, latencyMs: data.latency_ms ?? null })
+
+      if (!res.ok) {
+        // Pre-stream failure (validation error, rate limit, ...) — plain JSON body.
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `Request failed (${res.status})`)
+      }
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let gotFirstEvent = false
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        // { stream: true } holds back a multi-byte UTF-8 sequence split across
+        // chunk boundaries instead of emitting replacement characters.
+        buffer += decoder.decode(value, { stream: true })
+
+        let newlineIndex
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newlineIndex)
+          buffer = buffer.slice(newlineIndex + 1)
+          if (!line.trim()) continue
+          const event = JSON.parse(line)
+
+          // Either a delta or a tool_call marks the end of "waiting" — the
+          // model is visibly doing something now, whichever comes first.
+          if ((event.type === 'delta' || event.type === 'tool_call') && !gotFirstEvent) {
+            gotFirstEvent = true
+            stopTimer()
+          }
+
+          if (event.type === 'delta') {
+            patchLastMessage((last) => ({ text: last.text + event.text }))
+          } else if (event.type === 'tool_call') {
+            patchLastMessage((last) => ({
+              toolCalls: [...(last.toolCalls || []), { query: event.query, resultCount: event.result_count }],
+            }))
+          } else if (event.type === 'done') {
+            patchLastMessage(() => ({
+              citations: event.citations || [],
+              usage: event.usage || null,
+              latencyMs: event.latency_ms ?? null,
+            }))
+            setLastStats({ usage: event.usage || null, latencyMs: event.latency_ms ?? null })
+          } else if (event.type === 'error') {
+            patchLastMessage((last) => ({ text: `${last.text}\n\n_Error: ${event.message}_` }))
+          }
+        }
+      }
     } catch (err) {
-      setMessages((m) => [...m, { role: 'assistant', text: `Error: ${err.message}` }])
+      patchLastMessage((last) => ({ text: last.text || `Error: ${err.message}` }))
     } finally {
       stopTimer()
       setLoading(false)
@@ -81,9 +137,26 @@ export default function App() {
             <div key={i} className={`msg msg-${m.role}`}>
               <div className="msg-body">
                 <b className="msg-role">{m.role}</b>
+                {m.toolCalls && m.toolCalls.length > 0 && (
+                  <div className="tool-calls">
+                    {m.toolCalls.map((t, ti) => (
+                      <div key={ti} className="tool-call">
+                        🔍 Searching: <em>{t.query}</em>
+                        {t.resultCount > 0 ? ` (${t.resultCount} new result${t.resultCount === 1 ? '' : 's'})` : ' (no new results)'}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {m.role === 'assistant' ? (
                   <div className="md">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>
+                    {m.text ? (
+                      // Partial markdown mid-stream can render roughly (e.g. an
+                      // unclosed code fence or table row) — resolves once the
+                      // stream completes and the full text re-parses cleanly.
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>
+                    ) : (
+                      i === messages.length - 1 && loading && <span className="thinking">…</span>
+                    )}
                   </div>
                 ) : (
                   <span className="msg-text">{m.text}</span>
@@ -91,10 +164,19 @@ export default function App() {
               </div>
               {m.citations && m.citations.length > 0 && (
                 <div className="sources">
-                  Sources: {m.citations.map((c) => (
-                    <span key={c.n} className="source">
-                      [{c.n}] {c.source}
-                    </span>
+                  <span className="sources-label">Sources</span>
+                  {m.citations.map((c) => (
+                    <details key={c.n} className="source">
+                      <summary>
+                        [{c.n}] {c.source}
+                        {c.section ? ` · ${c.section}` : ''}
+                        {c.page != null ? ` · p.${c.page}` : ''}
+                      </summary>
+                      <div className="source-excerpt">
+                        {c.section_title && <div className="source-title">{c.section_title}</div>}
+                        {c.excerpt}
+                      </div>
+                    </details>
                   ))}
                 </div>
               )}
@@ -143,6 +225,12 @@ export default function App() {
               <span className="stat-key">in / out</span>
               <span className="stat-val">{lastStats?.usage ? `${lastStats.usage.input_tokens} / ${lastStats.usage.output_tokens}` : '—'}</span>
             </div>
+            {lastStats?.usage?.cache_read_tokens > 0 && (
+              <div className="stat-row stat-dim">
+                <span className="stat-key">cache read</span>
+                <span className="stat-val">{lastStats.usage.cache_read_tokens}</span>
+              </div>
+            )}
           </div>
 
           <div className="stat-group">

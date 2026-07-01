@@ -102,6 +102,24 @@ body {
 .msg-user .msg-role { color: var(--muted); }
 .msg-assistant .msg-role { color: var(--faa-navy); }
 
+.thinking {
+  color: var(--faint);
+  animation: pulse-text 1.1s ease-in-out infinite;
+}
+@keyframes pulse-text {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.9; }
+}
+
+.tool-calls { margin: 0.35rem 0; }
+.tool-call {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-style: italic;
+  padding: 0.1rem 0;
+}
+.tool-call em { font-style: normal; color: var(--faa-blue-ink); }
+
 /* Rendered markdown in assistant answers */
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
@@ -147,16 +165,48 @@ body {
 .md th, .md td { border: 1px solid var(--line); padding: 0.35rem 0.6rem; text-align: left; }
 .md th { background: #eef2f7; color: var(--faa-navy-dark); }
 
-.sources { margin-top: 0.45rem; font-size: 0.85rem; color: var(--muted); }
+.sources { margin-top: 0.5rem; font-size: 0.85rem; color: var(--muted); }
+.sources-label {
+  display: block;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  margin-bottom: 0.25rem;
+}
 .source {
-  display: inline-block;
-  margin-right: 0.4rem;
-  padding: 0.05rem 0.4rem;
+  display: block;
+  margin-bottom: 0.25rem;
+  padding: 0.15rem 0.5rem;
   background: #eaf0f9;
   color: var(--faa-blue-ink);
   border-radius: 4px;
   font-family: ui-monospace, Menlo, monospace;
   font-size: 0.78rem;
+}
+.source summary {
+  cursor: pointer;
+  list-style: none;
+}
+.source summary::-webkit-details-marker { display: none; }
+.source summary::before { content: '▸ '; }
+.source[open] summary::before { content: '▾ '; }
+.source-excerpt {
+  margin: 0.35rem 0 0.15rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--card);
+  border-left: 2px solid var(--faa-blue);
+  border-radius: 3px;
+  color: var(--ink);
+  font-family: system-ui, sans-serif;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.source-title {
+  font-weight: 700;
+  color: var(--faa-navy-dark);
+  margin-bottom: 0.15rem;
 }
 .usage {
   margin-top: 0.35rem;
