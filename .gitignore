@@ -15,6 +15,11 @@ dist/
 # RAG build artifact (regenerable via indexer.py)
 index.pkl
 
+# Eval run outputs (regenerable via eval/run_eval.py)
+eval/results.json
+eval/report.md
+eval/report_before.md
+
 # Claude local settings
 .claude/settings.local.json
 .claude

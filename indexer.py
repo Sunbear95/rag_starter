@@ -558,6 +558,7 @@ def search(
     relative_threshold: float = 0.5,
     use_rerank: bool = True,
     rerank_candidates: int | None = None,
+    max_per_section: int = 3,
 ) -> list[dict]:
     """Two-stage hybrid retrieval: recall with dense + lexical fusion, then
     (optionally) rerank the pool with a cross-encoder for precision.
@@ -566,9 +567,15 @@ def search(
     regulatory text leans on (e.g. "§ 91.155", "Part 61") since embeddings
     capture semantic similarity, not exact tokens. BM25 catches those verbatim;
     the two rankings are combined with Reciprocal Rank Fusion so neither score
-    scale has to be normalized against the other. A section dedup keeps only the
-    higher-ranked of two near-duplicate chunks from the same (source, section),
-    since a long CFR section is split into overlapping chunks.
+    scale has to be normalized against the other.
+
+    Per-section cap: a long CFR section is split into overlapping chunks, and
+    keeping only ONE per section starved long, multi-part sections — e.g.
+    § 61.109 spans ~19 chunks, so capping at one meant the model saw a section's
+    opening but not its tail, then cited a different chunk (even a neighboring
+    rating's) for a claim the missing chunk supported. Allow up to
+    `max_per_section` chunks per section, surfacing multiple parts of a long
+    section while still preventing one section from crowding out the rest.
 
     Stage 2 — precision. RRF rank position is a coarse signal, so when
     `use_rerank` is set the fused candidate pool (`rerank_candidates`, defaulting
@@ -610,14 +617,14 @@ def search(
     order = sorted(fused, key=lambda i: fused[i], reverse=True)
 
     candidates: list[tuple[float, dict]] = []      # (fused_score, record)
-    seen_sections: set[tuple[str, str]] = set()
+    section_counts: dict[tuple[str, str], int] = defaultdict(int)
     for idx in order:
         r = records[idx]
         key = (r["source"], r["section"]) if r["section"] else None
-        if key is not None and key in seen_sections:
+        if key is not None and section_counts[key] >= max_per_section:
             continue
         if key is not None:
-            seen_sections.add(key)
+            section_counts[key] += 1
         candidates.append((fused[idx], r))
         if len(candidates) >= pool_size:
             break

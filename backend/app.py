@@ -292,7 +292,7 @@ def chat():
     if not isinstance(user_message, str) or not user_message.strip():
         return jsonify({"error": "Request body must include a non-empty 'message' string."}), 400
 
-    # Concise mode: shorter answers, fewer output tokens. Defaults off.
+    # Concise mode: shorter answers in Rocky's voice, fewer output tokens. Defaults off.
     concise = bool(body.get("concise", False))
 
     t0 = time.perf_counter()  # measure end-to-end answer latency (retrieval + LLM, all turns)
