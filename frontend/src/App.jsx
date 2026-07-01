@@ -39,8 +39,6 @@ export default function App() {
     if (!input.trim() || loading) return
 
     const question = input
-    // Last few turns only, to keep request size (and cost) bounded.
-    const history = messages.slice(-8).map((m) => ({ role: m.role, text: m.text }))
     setMessages((m) => [...m, { role: 'user', text: question }])
     setInput('')
     setLoading(true)
@@ -51,7 +49,7 @@ export default function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question, history }),
+        body: JSON.stringify({ message: question }),
       })
 
       if (!res.ok) {
