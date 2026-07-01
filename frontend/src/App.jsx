@@ -123,6 +123,11 @@ export default function App() {
   const answered = messages.filter((m) => m.role === 'assistant' && m.usage)
   const sessionTokens = answered.reduce((sum, m) => sum + m.usage.total_tokens, 0)
 
+  // Retrieval detail (search keywords + chunks) for the latest answer, shown in
+  // the left panel instead of inline in the chat so the conversation stays clean.
+  const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
+  const retrievalCited = new Set((lastAssistant?.citations || []).map((c) => c.n))
+
   return (
     <div className="page">
       <header className="faa-header">
@@ -138,22 +143,50 @@ export default function App() {
       </header>
 
       <div className="layout">
+      <aside className="retrieval-panel" aria-live="polite">
+        <h2>Retrieval</h2>
+        <div className="retrieval-body">
+          {lastAssistant?.toolCalls && lastAssistant.toolCalls.length > 0 && (
+            <div className="retrieval-group">
+              <div className="retrieval-title">Search keywords</div>
+              <div className="tool-calls">
+                {lastAssistant.toolCalls.map((t, ti) => (
+                  <div key={ti} className="tool-call">
+                    🔍 <em>{t.query}</em>
+                    {t.resultCount > 0 ? ` (${t.resultCount} new result${t.resultCount === 1 ? '' : 's'})` : ' (no new results)'}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {lastAssistant?.retrieved && lastAssistant.retrieved.length > 0 ? (
+            <div className="retrieval-group">
+              <div className="retrieval-title">Retrieved chunks ({lastAssistant.retrieved.length})</div>
+              {lastAssistant.retrieved.map((r) => (
+                <details key={r.n} className={`rchunk ${retrievalCited.has(r.n) ? 'rchunk-cited' : ''}`}>
+                  <summary className="rchunk-head">
+                    <span className="rchunk-n">[{r.n}]</span> {r.source} · chunk #{r.chunk_index}
+                    {retrievalCited.has(r.n) && <span className="rchunk-badge">cited</span>}
+                  </summary>
+                  <div className="rchunk-text">{r.text}</div>
+                </details>
+              ))}
+            </div>
+          ) : (
+            (!lastAssistant?.toolCalls || lastAssistant.toolCalls.length === 0) && (
+              <div className="retrieval-empty">Ask a question to see the search keywords and retrieved chunks here.</div>
+            )
+          )}
+        </div>
+      </aside>
+
       <div className="app">
         <div className="messages">
           {messages.map((m, i) => (
             <div key={i} className={`msg msg-${m.role}`}>
               <div className="msg-body">
                 <b className="msg-role">{m.role}</b>
-                {m.toolCalls && m.toolCalls.length > 0 && (
-                  <div className="tool-calls">
-                    {m.toolCalls.map((t, ti) => (
-                      <div key={ti} className="tool-call">
-                        🔍 Searching: <em>{t.query}</em>
-                        {t.resultCount > 0 ? ` (${t.resultCount} new result${t.resultCount === 1 ? '' : 's'})` : ' (no new results)'}
-                      </div>
-                    ))}
-                  </div>
-                )}
                 {m.role === 'assistant' ? (
                   <div className="md">
                     {m.text ? (
@@ -194,23 +227,6 @@ export default function App() {
                   {m.latencyMs != null && `${(m.latencyMs / 1000).toFixed(2)}s`}
                 </div>
               )}
-              {m.retrieved && m.retrieved.length > 0 && (() => {
-                const cited = new Set((m.citations || []).map((c) => c.n))
-                return (
-                  <details className="retrieved">
-                    <summary>Retrieved chunks ({m.retrieved.length})</summary>
-                    {m.retrieved.map((r) => (
-                      <div key={r.n} className={`rchunk ${cited.has(r.n) ? 'rchunk-cited' : ''}`}>
-                        <div className="rchunk-head">
-                          <span className="rchunk-n">[{r.n}]</span> {r.source} · chunk #{r.chunk_index}
-                          {cited.has(r.n) && <span className="rchunk-badge">cited</span>}
-                        </div>
-                        <div className="rchunk-text">{r.text}</div>
-                      </div>
-                    ))}
-                  </details>
-                )
-              })()}
             </div>
           ))}
         </div>
