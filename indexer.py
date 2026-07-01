@@ -513,6 +513,7 @@ def search(
     records: list[dict],
     k: int = 5,
     relative_threshold: float = 0.5,
+    max_per_section: int = 3,
 ) -> list[dict]:
     """Hybrid search: fuse embedding similarity with BM25 keyword matching.
 
@@ -525,9 +526,15 @@ def search(
     Two trims keep the context block lean (fewer tokens billed, less noise for
     the model to synthesize over) without hurting recall:
 
-      - Section dedup: a long CFR section gets split into overlapping chunks
-        ([indexer.py:_split_body]), so two top hits can be near-duplicate text
-        from the same (source, section). Keep only the higher-scoring one.
+      - Per-section cap: a long CFR section gets split into overlapping chunks
+        ([indexer.py:_split_body]). Keeping only ONE chunk per section starved
+        long, multi-part sections — e.g. § 61.109 spans ~19 chunks, and capping
+        it at one meant the model saw the section's opening but not the tail,
+        then cited a different chunk (even a neighboring rating's) for a claim
+        the missing chunk actually supported. So allow up to `max_per_section`
+        chunks from the same section, which surfaces multiple parts of a long
+        section while still preventing a single section from crowding out all
+        the others.
       - Relevance gate: drop hits whose fused score is below
         `relative_threshold` of the best hit's score — they're unlikely to be
         worth their tokens. Always keeps at least the single best hit.
@@ -556,14 +563,14 @@ def search(
     order = sorted(fused, key=lambda i: fused[i], reverse=True)
 
     deduped: list[tuple[float, dict]] = []
-    seen_sections: set[tuple[str, str]] = set()
+    section_counts: dict[tuple[str, str], int] = defaultdict(int)
     for idx in order:
         r = records[idx]
         key = (r["source"], r["section"]) if r["section"] else None
-        if key is not None and key in seen_sections:
+        if key is not None and section_counts[key] >= max_per_section:
             continue
         if key is not None:
-            seen_sections.add(key)
+            section_counts[key] += 1
         deduped.append((fused[idx], r))
         if len(deduped) >= k:
             break
