@@ -94,7 +94,7 @@ export default function App() {
             // to drop here. It never belongs in the final answer.
             patchLastMessage((last) => ({
               text: '',
-              toolCalls: [...(last.toolCalls || []), { query: event.query, resultCount: event.result_count }],
+              toolCalls: [...(last.toolCalls || []), { name: event.name, query: event.query, resultCount: event.result_count }],
             }))
           } else if (event.type === 'done') {
             patchLastMessage(() => ({
@@ -125,6 +125,16 @@ export default function App() {
   // the left panel instead of inline in the chat so the conversation stays clean.
   const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
   const retrievalCited = new Set((lastAssistant?.citations || []).map((c) => c.n))
+
+  // Tools invoked for the latest answer, collapsed to per-tool call counts so
+  // the right panel shows *which* tools ran (and how often), not every query.
+  const toolUsage = Object.entries(
+    (lastAssistant?.toolCalls || []).reduce((acc, t) => {
+      const name = t.name || 'tool'
+      acc[name] = (acc[name] || 0) + 1
+      return acc
+    }, {})
+  )
 
   return (
     <div className="page">
@@ -267,6 +277,23 @@ export default function App() {
               <div className="stat-row stat-dim">
                 <span className="stat-key">cache read</span>
                 <span className="stat-val">{lastStats.usage.cache_read_tokens}</span>
+              </div>
+            )}
+          </div>
+
+          <div className="stat-group">
+            <div className="stat-title">Tools used</div>
+            {toolUsage.length > 0 ? (
+              toolUsage.map(([name, count]) => (
+                <div key={name} className="stat-row">
+                  <span className="stat-key">🔧 {name}</span>
+                  <span className="stat-val">{count}×</span>
+                </div>
+              ))
+            ) : (
+              <div className="stat-row stat-dim">
+                <span className="stat-key">none yet</span>
+                <span className="stat-val">—</span>
               </div>
             )}
           </div>

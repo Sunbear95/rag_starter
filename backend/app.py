@@ -263,6 +263,7 @@ def chat():
                     })
                     yield json.dumps({
                         "type": "tool_call",
+                        "name": block.name,
                         "query": query,
                         "result_count": len(new_hits),
                     }) + "\n"
