@@ -333,6 +333,25 @@ input {
 input:focus { border-color: var(--faa-blue); box-shadow: 0 0 0 3px rgba(38, 114, 222, 0.15); }
 input:disabled { background: #f1f4f9; color: var(--faint); }
 
+/* Concise-mode checkbox: opt out of the generic text-input styling above. */
+.concise-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+  color: var(--faint);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.concise-toggle input {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 0;
+  cursor: pointer;
+}
+
 button {
   padding: 0.7rem 1.3rem;
   font-size: 0.95rem;
