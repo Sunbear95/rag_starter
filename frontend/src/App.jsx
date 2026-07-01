@@ -89,7 +89,13 @@ export default function App() {
           if (event.type === 'delta') {
             patchLastMessage((last) => ({ text: last.text + event.text }))
           } else if (event.type === 'tool_call') {
+            // Any text streamed so far this turn was pre-tool-call preamble
+            // (e.g. "Let me search for that!") the model emitted before
+            // deciding to call the tool — the backend only sends tool_call
+            // after that iteration's text has fully streamed, so it's safe
+            // to drop here. It never belongs in the final answer.
             patchLastMessage((last) => ({
+              text: '',
               toolCalls: [...(last.toolCalls || []), { query: event.query, resultCount: event.result_count }],
             }))
           } else if (event.type === 'done') {

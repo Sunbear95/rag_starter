@@ -214,7 +214,7 @@ def chat():
                 offer_tool = iteration < MAX_TOOL_ITERATIONS - 1
                 stream_kwargs = dict(
                     model="claude-sonnet-4-6",
-                    max_tokens=1024,
+                    max_tokens=4096,
                     # Cached: the system prompt is static across every request, so after
                     # the first call this is served from cache instead of billed as
                     # fresh input.
